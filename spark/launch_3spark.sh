@@ -27,6 +27,8 @@ PORT=${PORT:-18100}
 MASTER_PORT=${MASTER_PORT:-29620}
 NAME=${NAME:-i2spark}
 RESERVE_GB=${RESERVE_GB:-10}          # unified memory: keep room for the OS (GLM's TensorFold reserved 10.5 GiB)
+# glibc: blocks of 256 KiB and more are mapped on their own and returned when freed (with the server's malloc_trim,
+# this keeps rank 0's memory flat under long agent prompts; without them it grew ~100 MB per request until OOM).
 # Defaults: one-exchange all-reduce for decode-sized calls (I2_P2P_AR=1). Faster, slightly lossy: EXTRA_ENV="-e I2_ATTN_FP8=1"
 
 field() { echo "$1" | cut -d: -f"$2"; }
@@ -42,7 +44,8 @@ NCCL_ENV="-e NCCL_SOCKET_IFNAME=$BOOTSTRAP_IF -e GLOO_SOCKET_IFNAME=$BOOTSTRAP_I
  -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1 -e NCCL_IB_SUBNET_PREFIX_LEN=30 \
  -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_IB_MERGE_NICS=0 -e NCCL_NET_PLUGIN=none \
  -e NCCL_CUMEM_ENABLE=0 -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 \
- -e TORCH_NCCL_USE_COMM_NONBLOCKING=0 -e NCCL_DEBUG=${NCCL_DEBUG:-WARN} -e I2_P2P_AR=${I2_P2P_AR:-1} ${EXTRA_ENV:-}"     # EXTRA_ENV="-e I2_PROFILE_AT=60 ..."
+ -e TORCH_NCCL_USE_COMM_NONBLOCKING=0 -e NCCL_DEBUG=${NCCL_DEBUG:-WARN} -e I2_P2P_AR=${I2_P2P_AR:-1} \
+ -e MALLOC_MMAP_THRESHOLD_=262144 -e MALLOC_TRIM_THRESHOLD_=33554432 ${EXTRA_ENV:-}"     # EXTRA_ENV="-e I2_PROFILE_AT=60 ..."
 FLAGS="--gpus all --network host --ipc=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK \
  --ulimit memlock=-1 --ulimit stack=67108864"
 

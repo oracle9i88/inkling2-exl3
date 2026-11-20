@@ -509,6 +509,24 @@ def try_admit():
 
 TIMING = os.environ.get("I2_TIMING", "0") == "1"
 
+# 11-20: rank 0's resident memory grew ~100 MB per long request (request bodies, prompt text and token lists of 100K+
+# token conversations) until the node ran out of memory twice. glibc keeps such freed blocks in the heap; give them back
+# with malloc_trim after requests finish: when idle, or under steady load at most every TRIM_EVERY seconds. I2_TRIM=0: off.
+import ctypes
+_LIBC = ctypes.CDLL("libc.so.6") if os.environ.get("I2_TRIM", "1") == "1" else None
+TRIM_EVERY = float(os.environ.get("I2_TRIM_EVERY", "60"))
+TRIM = {"pending": 0, "last": 0.0}
+STATS["trims"] = 0; STATS["trim_ms_last"] = 0.0; STATS["trim_ms_max"] = 0.0
+
+def maybe_trim(idle):
+    if _LIBC is None or not TRIM["pending"]: return
+    now = time.time()
+    if now - TRIM["last"] < (5.0 if idle else TRIM_EVERY): return
+    _LIBC.malloc_trim(0)
+    dt = (time.time() - now) * 1000
+    TRIM["last"] = time.time(); TRIM["pending"] = 0
+    STATS["trims"] += 1; STATS["trim_ms_last"] = round(dt, 1); STATS["trim_ms_max"] = round(max(STATS["trim_ms_max"], dt), 1)
+
 def finish(req, reason):
     req.finish = reason
     if TIMING:
@@ -519,6 +537,7 @@ def finish(req, reason):
     active.pop(req.slot, None)
     free_slots.append(req.slot); pcache.release(req.pages)
     emit(req, ("done", reason))
+    TRIM["pending"] += 1
 
 def scheduler():
     last_hb = time.time()
@@ -603,6 +622,7 @@ def scheduler():
                     k = int(n_t[st, i]) + 1
                     handle_tokens(req, emit_t[st, i, :k].tolist())
             did = True
+        maybe_trim(idle = not did and not active and not prefilling)
         if not did:
             time.sleep(0.002)
             if time.time() - last_hb > 1.0:
@@ -765,6 +785,8 @@ def norm_messages(msgs, images=None):
     out = []
     for m in msgs:
         m = dict(m)
+        if m.get("role") == "developer":                 # OpenAI's newer name for the system role; the template knows "system"
+            m["role"] = "system"
         if isinstance(m.get("content"), list):
             parts = []
             for p in m["content"]:
@@ -825,7 +847,7 @@ async def chat_completions(request: Request):
     body = await request.json()
     try:
         req, out_q, nprompt = await run_request(body, True)
-    except (ValueError, OSError) as e:                     # bad image / unsupported content
+    except (ValueError, OSError, jinja2.TemplateError) as e:   # bad image / unsupported content / message the template rejects
         return JSONResponse(status_code=400, content={"error": {"message": str(e), "type": "invalid_request_error"}})
     req.t_http = t_http
     stream = bool(body.get("stream"))
@@ -876,7 +898,10 @@ async def chat_completions(request: Request):
 @app.post("/v1/completions")
 async def completions(request: Request):
     body = await request.json()
-    req, out_q, nprompt = await run_request(body, False)
+    try:
+        req, out_q, nprompt = await run_request(body, False)
+    except (ValueError, OSError, jinja2.TemplateError) as e:
+        return JSONResponse(status_code=400, content={"error": {"message": str(e), "type": "invalid_request_error"}})
     text, fin = "", "stop"
     while True:
         kind, val = await out_q.get()
