@@ -349,15 +349,9 @@ class LayerWeights:
 # ----------------------------------------------------------------------------------------------------------------------
 # Layer computation
 
-def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor | None, adt = torch.bfloat16,
-                    cache = None, pos0: int = 0):
-    """
-    Attention half of a decoder layer for one sequence.
-    hidden: [S, D] adt, blocks: [nb, S, D] adt or None. Returns the post-attention-conv output [S, D] (adt).
-    """
+def attn_inputs(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor | None, adt = torch.bfloat16):
+    """The normed inputs (xq, xk, xv) [S, D] adt of the attention projections; one shared tensor in sliding layers"""
     cfg, i = W.cfg, W.i
-    S = hidden.shape[0]
-    H, Hk, dh, dr = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.d_rel
     if W.is_global:
         if i == 0:
             xq = xk = xv = hidden.float()
@@ -369,10 +363,36 @@ def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor 
     else:
         x = hidden.float() if i == 0 else attn_res(blocks, hidden, W.attn_query, cfg.eps)
         xq = xk = xv = rms_norm(x, W.attn_norm, cfg.eps).to(adt)
+    return xq, xk, xv
 
-    q = F.linear(xq, W.wq)
-    k = F.linear(xk, W.wk)
-    v = F.linear(xv, W.wv)
+
+_ATTN_W = {"q": "wq", "k": "wk", "v": "wv", "gate": "wgate", "o": "wo"}
+
+
+def _proj(W: LayerWeights, name: str, x: torch.Tensor, qlin) -> torch.Tensor:
+    if qlin is not None and name in qlin:
+        return qlin[name](x)
+    return F.linear(x, getattr(W, _ATTN_W[name]))
+
+
+def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor | None, adt = torch.bfloat16,
+                    cache = None, pos0: int = 0, taps: dict | None = None, qlin: dict | None = None):
+    """
+    Attention half of a decoder layer for one sequence.
+    hidden: [S, D] adt, blocks: [nb, S, D] adt or None. Returns the post-attention-conv output [S, D] (adt).
+    taps: if a dict, receives the projection inputs xq / xk / xv and o (the gated input of wo).
+    qlin: optional replacements {"q" | "k" | "v" | "gate" | "o": callable x -> x @ W^T} (quantized projections).
+    """
+    cfg, i = W.cfg, W.i
+    S = hidden.shape[0]
+    H, Hk, dh, dr = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.d_rel
+    xq, xk, xv = attn_inputs(W, hidden, blocks, adt)
+    if taps is not None:
+        taps["xq"], taps["xk"], taps["xv"] = xq, xk, xv
+
+    q = _proj(W, "q", xq, qlin)
+    k = _proj(W, "k", xk, qlin)
+    v = _proj(W, "v", xv, qlin)
     cs = cache.conv if cache is not None else {}
     if W.is_global:
         k = dyn_short_conv(k, xk, W.kc_static, W.kc_proj, Hk, cfg.conv_k, adt, cs.get("k"))
@@ -383,7 +403,7 @@ def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor 
     if cache is not None:
         (k, cs["k"]), (v, cs["v"]) = k, v
     r = F.linear(xq, W.wr)
-    gate = F.linear(xq, W.wgate)
+    gate = _proj(W, "gate", xq, qlin)
     sinks = F.linear(xq, W.wsink)
 
     q = l2_clip(q.view(S, H, dh), cfg.qk_clip, W.q_scale)
@@ -413,7 +433,9 @@ def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor 
     ).to(adt)
     o = o.reshape(S, H * dh)
     o = (o.float() * torch.sigmoid(gate.float())).to(adt)
-    o = F.linear(o, W.wo)
+    if taps is not None:
+        taps["o"] = o
+    o = _proj(W, "o", o, qlin)
     if cache is None:
         return short_conv(o, W.attn_sconv, cfg.conv_k, adt)
     out, cs["attn"] = short_conv(o, W.attn_sconv, cfg.conv_k, adt, cs["attn"])

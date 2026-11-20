@@ -18,3 +18,7 @@
   specific language governing permissions and limitations under the License.
 - NVIDIA CUTLASS DSL (`nvidia-cutlass-dsl`), installed from PyPI under NVIDIA's license; it compiles the b12x kernels.
 - Inkling-2-Small model by Thinking Machines, Apache-2.0. The EXL3 quant weights are a derivative under the same license.
+- `server/chat_template-2ad1157.jinja` is the chat template of Inkling-2-Small (Thinking Machines, revision 2ad1157),
+  Apache-2.0, copied unmodified.
+- The vision serving (`server/i2_vision.py`) imports the Inkling-2 vision tower and image processor from transformers
+  5.23 (Apache-2.0) at runtime; they are not vendored here.

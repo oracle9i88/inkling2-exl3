@@ -10,7 +10,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from . import inkling2_ops as ops
-from .inkling2_gemm import skinny_mm
+from . import inkling2_attnq as AQ
+from .inkling2_gemm import skinny_mm, quant_fp8_rows
 from ..architecture.inkling2 import Inkling2Model, Inkling2Layer
 
 RING_EXTRA = 64            # SWA ring headroom for speculative tokens beyond the window
@@ -23,8 +24,9 @@ MAX_ROWS_DEFAULT = 512
 class Batch:
     """Token batch descriptor (all int32 device tensors of length T; rows of a sequence contiguous, ascending)"""
 
-    def __init__(self, slot, pos, nprev, multi: bool, nsplit_g: int = 1, nsplit_l: int = 4, nafter = None):
+    def __init__(self, slot, pos, nprev, multi: bool, nsplit_g: int = 1, nsplit_l: int = 4, nafter = None, seq_rows = None):
         self.slot, self.pos, self.nprev = slot, pos, nprev
+        self.seq_rows = seq_rows        # every sequence has exactly this many rows (speculative verify), or None
         self.single = nafter is None
         if nafter is None:      # single sequence in the batch
             nafter = (slot.shape[0] - 1 - nprev).to(torch.int32)
@@ -62,8 +64,12 @@ class I2Engine:
             self.embed_w = model.embed.weight
         self.head = model.head
         c = self.cfg
-        self.Hl, self.Hkl = c.heads // world, c.kv_heads // world
+        # heads of this rank: whole KV groups, possibly uneven over the ranks (3 / 3 / 2 KV heads on 3 ranks)
+        self.shard = self.layers[0].shard
+        assert all(L.shard == self.shard for L in self.layers)
+        self.Hl, self.Hkl = self.shard.hl, self.shard.hkl
         self.G = self.Hl // self.Hkl
+        assert self.G * self.Hkl == self.Hl and self.G == c.heads // c.kv_heads
         self.ring = c.window + max(RING_EXTRA, max_rows)
         self.max_rows = max_rows
         dev = device
@@ -98,8 +104,40 @@ class I2Engine:
         self.ar_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[__import__('os').environ.get('I2_AR_DTYPE', 'fp16')]
         self.skinny = __import__('os').environ.get('I2_SKINNY', '1') == '1'      # Triton skinny GEMM for T <= 64 projections
         self.rel_fused = __import__('os').environ.get('I2_REL_FUSED', '1') == '1'   # relative bias inside the attention kernel
+        # long prefill, global layers: the keys more than rel_extent behind a chunk's first row go to a kernel that loads
+        # each key tile once for many rows (ops._attn_far_kernel). I2_FAR = "near splits,far splits,rows*heads per far
+        # program" (0: off), used for single-sequence calls of at least I2_FAR_MIN rows
+        fs = __import__('os').environ.get('I2_FAR', '2,6,64')
+        self.far = tuple(int(x) for x in fs.split(',')) if fs not in ('', '0') else None
+        if self.far is not None:
+            ns = self.far[0] + self.far[1]
+            assert ns & (ns - 1) == 0 and self.far[2] & (self.far[2] - 1) == 0, f"I2_FAR {fs}: splits must sum to a power of 2"
+        self.far_min = int(__import__('os').environ.get('I2_FAR_MIN', 256))
+        # the same for speculative verify (Batch.seq_rows = R rows per sequence, one far program per sequence):
+        # I2_FAR_V = "near splits,far splits" (0: off)
+        fs = __import__('os').environ.get('I2_FAR_V', '2,30')
+        self.far_v = tuple(int(x) for x in fs.split(',')) if fs not in ('', '0') else None
+        if self.far_v is not None:
+            ns = self.far_v[0] + self.far_v[1]
+            assert ns & (ns - 1) == 0, f"I2_FAR_V {fs}: splits must sum to a power of 2"
         self.b12x = None          # optional inkling2_b12x.B12xMoE (b12x fused Trellis MoE for the prepared batch sizes)
         self.moe_group = int(__import__('os').environ.get('I2_MOE_GROUP', 64))   # rows per fused coop MoE call (P0, validated on v3; 8 = old path)
+        _env = __import__('os').environ
+        # FP8 (e4m3, per-row scale) copies of the attention projections for decode-sized calls (<= 64 rows, skinny GEMM).
+        # On DGX Spark a one-token step is bound by reading these BF16 weights (~3.5 GB per rank); prefill keeps BF16.
+        self.attn_fp8 = _env.get('I2_ATTN_FP8', '0') == '1'
+        if self.attn_fp8:
+            for L in self.layers:
+                if getattr(L, "attn_q", False):                 # EXL3 projections (v3) have no bf16 copy to cast
+                    continue
+                names = ("wq_cat", "wk_cat", "wv_cat", "wo") if L.is_global else ("wqkv", "wo")
+                L.fp8 = {n: quant_fp8_rows(getattr(L, n)) for n in names}
+            torch.cuda.empty_cache()
+        # decode-sized all-reduces as one exchange (send the partial to every peer, add the world's partials in rank
+        # order in fp32: identical on every rank) instead of NCCL's ring (2 * (world - 1) hops)
+        self.p2p = _env.get('I2_P2P_AR', '0') == '1' and world > 1
+        self.p2p_max_rows = int(_env.get('I2_P2P_MAX_ROWS', 64))
+        self.peers = [r for r in range(world) if r != rank]
 
     # ---- memory accounting
     def kv_bytes(self):
@@ -108,18 +146,55 @@ class I2Engine:
             tot += sum(x.numel() * x.element_size() for x in t if x is not None)
         return tot
 
-    def mm(self, x, w):
-        """x [T, K] @ w[N, K]^T in bf16 (skinny Triton GEMM for decode/verify-sized T)"""
+    def mm(self, x, w, w8 = None):
+        """x [T, K] @ w[N, K]^T in bf16 (skinny Triton GEMM for decode/verify-sized T; w8 = its FP8 copy, if any)"""
         if self.skinny and x.shape[0] <= 64:
+            if w8 is not None:
+                return skinny_mm(x, w8[0], scale = w8[1], out_dtype = torch.bfloat16)
             return skinny_mm(x, w, out_dtype = torch.bfloat16)
         return torch.mm(x, w.t())
+
+    def w8(self, L, name):
+        return L.fp8[name] if self.attn_fp8 else None
+
+    def attn_proj_q(self, L, xq, xk = None, xv = None):
+        """EXL3 projections (v3) assembled into the layouts of the fused bf16 matrices. Sliding layers (xk None):
+        qb = [q | rel | gate | sink | k | v]; global layers: qb = [q | rel | gate | sink], kb = [k | kproj],
+        vb = [v | vproj]. rel and sink come from the bf16 wrs, the conv projections from kproj / vproj."""
+        Hl, Hkl = self.Hl, self.Hkl
+        T, hq, hr = xq.shape[0], Hl * 128, Hl * 16
+        y = AQ.run(L.lin_qgkv if xk is None else L.lin_qg, xq)                  # fp16 [T, 2 hq (+ 2 Hkl * 128)]
+        rs = self.mm(xq, L.wrs)                                                 # bf16 [T, Hl * 17]
+        n = 2 * hq + hr + Hl
+        qb = torch.empty((T, n + (2 * Hkl * 128 if xk is None else 0)), dtype = torch.bfloat16, device = xq.device)
+        qb[:, :hq] = y[:, :hq]
+        qb[:, hq:hq + hr] = rs[:, :hr]
+        qb[:, hq + hr:2 * hq + hr] = y[:, hq:2 * hq]
+        qb[:, 2 * hq + hr:n] = rs[:, hr:]
+        if xk is None:
+            qb[:, n:] = y[:, 2 * hq:]
+            return qb
+        kb = torch.cat([AQ.run(L.lin_k, xk).to(torch.bfloat16), self.mm(xk, L.kproj)], 1)
+        vb = torch.cat([AQ.run(L.lin_v, xv).to(torch.bfloat16), self.mm(xv, L.vproj)], 1)
+        return qb, kb, vb
 
     # ---- collectives
     _NO_AR = __import__('os').environ.get('I2_NO_AR', '0') == '1'      # timing diagnostics only: outputs are wrong
 
     def allreduce(self, x):
         if self.world > 1 and not self._NO_AR:
-            dist.all_reduce(x)
+            if self.p2p and x.shape[0] <= self.p2p_max_rows:
+                buf = torch.empty((self.world,) + tuple(x.shape), dtype = x.dtype, device = x.device)
+                buf[self.rank].copy_(x)
+                ops = []
+                for p in self.peers:
+                    ops.append(dist.P2POp(dist.isend, x, p))
+                    ops.append(dist.P2POp(dist.irecv, buf[p], p))
+                for w in dist.batch_isend_irecv(ops):
+                    w.wait()
+                x.copy_(buf.float().sum(0))
+            else:
+                dist.all_reduce(x)
         return x
 
     # ---- embedding / head
@@ -138,11 +213,23 @@ class I2Engine:
         c = self.cfg
         return ops.attn_res_norm(blocks, c.layers // c.block_layers, h, self.head.out_query[None], self.head.norm, c.eps)[0]
 
+    def head_mm(self, x):
+        """x [T, D] -> this rank's raw logits [T, V/world] fp32: the EXL3 head of v3 (padded vocabulary), or bf16"""
+        if self.head.lin_head is not None:
+            return AQ.run_f32(self.head.lin_head, x)
+        return torch.mm(x, self.head.unembed.t(), out_dtype = torch.float32)
+
+    def head_mm_bf16(self, x):
+        """the drafter's base logits [T, V/world] bf16 from the same head"""
+        if self.head.lin_head is not None:
+            return AQ.run(self.head.lin_head, x).to(torch.bfloat16)
+        return torch.mm(x, self.head.unembed.t())
+
     def head_logits(self, h, blocks):
         """h: [T, D] bf16, blocks: [8, T, D]. Returns this rank's softcapped logits shard [T, V/world] fp32"""
         c = self.cfg
         x = self.head_hidden(h, blocks)
-        z = torch.mm(x, self.head.unembed.t(), out_dtype = torch.float32)
+        z = self.head_mm(x)
         return torch.tanh(z / c.final_cap) * c.final_cap
 
     def global_argmax(self, z):
@@ -181,9 +268,12 @@ class I2Engine:
         # attention input(s) and projections
         if L.is_global:
             xs = ops.attn_res_norm(blocks, nb, h, L.attn_query, L.qkv_norms, c.eps)        # [3, T, D]
-            qb = self.mm(xs[0], L.wq_cat)
-            kb = self.mm(xs[1], L.wk_cat)
-            vb = self.mm(xs[2], L.wv_cat)
+            if L.attn_q:
+                qb, kb, vb = self.attn_proj_q(L, xs[0], xs[1], xs[2])
+            else:
+                qb = self.mm(xs[0], L.wq_cat, self.w8(L, "wq_cat"))
+                kb = self.mm(xs[1], L.wk_cat, self.w8(L, "wk_cat"))
+                vb = self.mm(xs[2], L.wv_cat, self.w8(L, "wv_cat"))
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             ops.qkv_post(qb, kb, vb, L.kc_static, L.vc_static, L.q_scale, L.rel_scale, kring, vring, B.slot, B.pos, B.nprev,
                          q_out, rel_out, kq, vq, ks, vs, self.page_table, c, True, bits, rel_off, Hkl * 128, Hkl * 128,
@@ -195,7 +285,7 @@ class I2Engine:
                 x = ops.attn_res_norm(blocks, 0, h, torch.zeros((1, c.hidden), device = h.device), L.attn_norm, c.eps)
             else:
                 x = ops.attn_res_norm(blocks, nb, h, L.attn_query[None], L.attn_norm, c.eps)
-            qb = self.mm(x[0], L.wqkv)
+            qb = self.attn_proj_q(L, x[0]) if L.attn_q else self.mm(x[0], L.wqkv, self.w8(L, "wqkv"))
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             koff = sink_off + Hl
             kbv, vbv = qb[:, koff:], qb[:, koff + Hkl * 128:]
@@ -219,14 +309,30 @@ class I2Engine:
             relarg = None
         o = torch.empty((T, Hl * 128), dtype = torch.bfloat16, device = h.device)
         nsplit = B.nsplit_g if L.is_global else B.nsplit_l
-        pm = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = h.device)
-        pl = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = h.device)
-        po = torch.empty((T, Hl, nsplit, 128), dtype = torch.float32, device = h.device)
         gq = dict(rot = self.kv_rot, ng = self.kv_ng, q16 = self.kv_q16) if L.is_global else {}
+        ns = nsplit
+        if L.is_global and self.far is not None and B.multi and B.single and T >= self.far_min:
+            nsplit, gq["ns_far"], gq["far_m"] = self.far
+            ns = nsplit + gq["ns_far"]
+        elif L.is_global and self.far_v is not None and B.multi and B.seq_rows and B.seq_rows * G <= 128:
+            nsplit, gq["ns_far"] = self.far_v
+            gq["far_m"] = max(16, 1 << (B.seq_rows * G - 1).bit_length())
+            gq["far_seq_rows"] = B.seq_rows
+            ns = nsplit + gq["ns_far"]
+        pm = torch.empty((T, Hl, ns), dtype = torch.float32, device = h.device)
+        pl = torch.empty((T, Hl, ns), dtype = torch.float32, device = h.device)
+        po = torch.empty((T, Hl, ns, 128), dtype = torch.float32, device = h.device)
         ops.attention(q_out, R, sink, gate, kq, vq, ks, vs, self.page_table if L.is_global else None, B.slot, B.pos,
                       (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G, rel = relarg, **gq)
-        if self.skinny and T <= 64:
-            oa = skinny_mm(o, L.wo, out_dtype = self.ar_dtype)          # fp32 accumulation, one rounding to the AR dtype
+        if L.attn_q:
+            oa = AQ.run(L.lin_o, o)
+            if oa.dtype != self.ar_dtype:
+                oa = oa.to(self.ar_dtype)
+        elif self.skinny and T <= 64:
+            if self.attn_fp8:
+                oa = skinny_mm(o, L.fp8["wo"][0], scale = L.fp8["wo"][1], out_dtype = self.ar_dtype)
+            else:
+                oa = skinny_mm(o, L.wo, out_dtype = self.ar_dtype)          # fp32 accumulation, one rounding to the AR dtype
         else:
             oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
             if self.ar_dtype != torch.float32:
@@ -269,12 +375,16 @@ class I2Engine:
 
     TAP_LAYERS = (5, 11, 17, 23, 29, 35, 41)
 
-    def forward(self, ids, B: Batch, stop_layer = None, taps = None, return_hidden = False):
+    def forward(self, ids, B: Batch, stop_layer = None, taps = None, return_hidden = False, img = None):
         """ids: [T] token ids (all ranks pass the same ids). Returns this rank's logits shard [T, V/world].
         taps: optional [T, 8, D] bf16 buffer receiving the draft's target features (inputs of layers 5..41, final-norm output)"""
         assert not (B.multi and B.single and B.T > self.max_rows), \
             f"{B.T} rows of one sequence exceed the SWA ring headroom (max_rows {self.max_rows}): chunk the call"
         h = self.embed_tokens(ids)
+        if img is not None:
+            # image features replace the placeholder rows after the embedding norm, like the reference
+            rows, feats = img
+            h[rows] = feats.to(h.dtype)
         blocks = self.new_blocks(h.shape[0])
         for L in self.layers:
             if taps is not None and L.idx in self.TAP_LAYERS:
@@ -287,7 +397,7 @@ class I2Engine:
             taps[:, 7].copy_(x)
         if return_hidden:
             return x
-        z = torch.mm(x, self.head.unembed.t(), out_dtype = torch.float32)
+        z = self.head_mm(x)
         return torch.tanh(z / self.cfg.final_cap) * self.cfg.final_cap
 
 

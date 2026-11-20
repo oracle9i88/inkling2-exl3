@@ -439,7 +439,12 @@ def _attn_kernel(
     IS_GLOBAL: tl.constexpr, BITS: tl.constexpr, RING: tl.constexpr, PS: tl.constexpr, WINDOW: tl.constexpr,
     EXTENT: tl.constexpr, NG: tl.constexpr = 1, Q16: tl.constexpr = False,
     relq_ptr = None, relp_ptr = None, REL_FUSED: tl.constexpr = False,
+    FAR: tl.constexpr = False, NSTRIDE: tl.constexpr = 0, FAR_SEQ_ROWS: tl.constexpr = 0,
 ):
+    # FAR (global layers): this kernel covers only [far_end, pos] of every row; the keys before far_end are
+    # _attn_far_kernel's (no bias, no mask there), whose partials sit after this kernel's NSPLIT ones. far_end comes from
+    # the first row of the row's sequence: row 0 (one sequence, a prefill chunk) or, with FAR_SEQ_ROWS = R, row
+    # t - t % R (speculative verify: R consecutive positions per sequence)
     t = tl.program_id(0)
     hk = tl.program_id(1)
     sp = tl.program_id(2)
@@ -454,6 +459,12 @@ def _attn_kernel(
     sink = tl.load(sink_ptr + t * stride_sink_t + hq, mask = gm, other = 0.0).to(tl.float32)
     if IS_GLOBAL:
         lo = 0
+        if FAR:
+            if FAR_SEQ_ROWS > 0:
+                pf = pos - t % FAR_SEQ_ROWS
+            else:
+                pf = tl.load(pos_ptr)
+            lo = tl.maximum(0, pf - EXTENT + 1) // BN * BN
     else:
         lo = tl.maximum(0, pos - WINDOW + 1)
     n = pos - lo + 1
@@ -499,10 +510,70 @@ def _attn_kernel(
         v = _load_kv_tile(vq_ptr, vs_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH, NG, Q16)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v.to(tl.float16))
         m_i = m_new
-    pbase = ((t * HL + hq) * NSPLIT + sp)
+    if NSTRIDE > 0:
+        pbase = ((t * HL + hq) * NSTRIDE + sp)
+    else:
+        pbase = ((t * HL + hq) * NSPLIT + sp)
     tl.store(pm_ptr + pbase, m_i, mask = gm)
     tl.store(pl_ptr + pbase, l_i, mask = gm)
     tl.store(po_ptr + pbase[:, None] * DH + offs_d[None, :], acc, mask = gm[:, None])
+
+
+@triton.jit
+def _attn_far_kernel(
+    q_ptr, kq_ptr, vq_ptr, ks_ptr, vs_ptr, page_table_ptr, pt_stride, slot_ptr, pos_ptr, pm_ptr, pl_ptr, po_ptr, T,
+    cache_stride_pos, cache_stride_h, sc_stride_pos, sm_scale,
+    G: tl.constexpr, DH: tl.constexpr, HKL: tl.constexpr, M: tl.constexpr, BMR: tl.constexpr, BN: tl.constexpr,
+    NS_FAR: tl.constexpr, SPLIT_OFF: tl.constexpr, NSTRIDE: tl.constexpr, BITS: tl.constexpr, PS: tl.constexpr,
+    EXTENT: tl.constexpr, NG: tl.constexpr = 1, Q16: tl.constexpr = False, SEQ_ROWS: tl.constexpr = 0,
+):
+    """Global layer, one sequence's prefill chunk (rows ascending from pos[0]) or, with SEQ_ROWS = R = BMR, R rows of
+    consecutive positions per sequence and one sequence per program (speculative verify): the keys [0, far_end) with
+    far_end = (first row's pos - EXTENT + 1) rounded down to BN. They precede every row by at least EXTENT positions, so there is
+    no relative bias and no causal mask, and one program serves BMR rows x G heads (packed into M matrix rows, the
+    last M - BMR * G unused) with each key tile it loads.
+    Writes split SPLIT_OFF + sp of each row's partials (no sink: the per-row kernel's split 0 has it)"""
+    rb = tl.program_id(0)
+    hk = tl.program_id(1)
+    sp = tl.program_id(2)
+    HL: tl.constexpr = G * HKL
+    r = tl.arange(0, M)
+    t = rb * BMR + r // G
+    hq = hk * G + r % G
+    rmask = (r < BMR * G) & (t < T)
+    offs_d = tl.arange(0, DH)
+    q = tl.load(q_ptr + (t * HL + hq)[:, None] * DH + offs_d[None, :], mask = rmask[:, None], other = 0.0)
+    if SEQ_ROWS > 0:
+        fr = rb * BMR
+    else:
+        fr = 0
+    slot = tl.load(slot_ptr + fr)
+    far_end = tl.maximum(0, tl.load(pos_ptr + fr) - EXTENT + 1) // BN * BN
+    nblk = far_end // BN
+    bps = (nblk + NS_FAR - 1) // NS_FAR
+    b0 = sp * bps
+    b1 = tl.minimum(b0 + bps, nblk)
+    m_i = tl.full([M], -1e30, dtype = tl.float32)
+    l_i = tl.zeros([M], dtype = tl.float32)
+    acc = tl.zeros([M, DH], dtype = tl.float32)
+    for b in range(b0, b1):
+        j = b * BN + tl.arange(0, BN)
+        valid = j < far_end
+        pg = tl.load(page_table_ptr + slot * pt_stride + j // PS, mask = valid, other = 0)
+        rows = pg.to(tl.int64) * PS + j % PS
+        k = _load_kv_tile(kq_ptr, ks_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH, NG, Q16)
+        s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * sm_scale
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        v = _load_kv_tile(vq_ptr, vs_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH, NG, Q16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v.to(tl.float16))
+        m_i = m_new
+    pbase = (t * HL + hq) * NSTRIDE + SPLIT_OFF + sp
+    tl.store(pm_ptr + pbase, m_i, mask = rmask)
+    tl.store(pl_ptr + pbase, l_i, mask = rmask)
+    tl.store(po_ptr + pbase[:, None] * DH + offs_d[None, :], acc, mask = rmask[:, None])
 
 
 @triton.jit
@@ -530,13 +601,31 @@ def _attn_combine_kernel(pm_ptr, pl_ptr, po_ptr, gate_ptr, o_ptr, stride_gate_t,
     tl.store(o_ptr + (t * HL + h) * DH + offs_d, o.to(tl.bfloat16))
 
 
+FAR_WARPS = int(__import__('os').environ.get('I2_FAR_WARPS', 4))
+
+
 def attention(q, R, sink, gate, kq, vq, ks, vs, page_table, slot, pos, scratch, o_out, cfg, is_global, bits, ring_size, ps,
-              nsplit, hkl, g, bn = 64, rot = None, ng = 1, q16 = False, rel = None):
+              nsplit, hkl, g, bn = 64, rot = None, ng = 1, q16 = False, rel = None, ns_far = 0, far_m = 64, far_seq_rows = 0):
+    """ns_far > 0 (global layer, rows = one sequence's consecutive positions from pos[0]): keys more than rel_extent
+    behind pos[0] go to _attn_far_kernel (ns_far splits, far_m // g rows per program); scratch must then hold
+    nsplit + ns_far partials per row and head, a power of 2. far_seq_rows = R > 0: rows come as R consecutive positions
+    per sequence (speculative verify), one far program per sequence (R * g <= far_m)"""
     """rel: optional (rel_q [T, Hl, 16] bf16, rel_proj [16, EXTENT] fp32) -> relative bias computed in-kernel (R unused)"""
     """q: [T, Hl, 128] bf16, R: [T, Hl, 1024] fp32, sink: [T, Hl] view, gate: [T, Hl*128] view. Writes o_out [T, Hl*128] bf16"""
     T = q.shape[0]
     pm, pl, po = scratch
     HL = g * hkl
+    far = bool(ns_far) and is_global                    # scratch then holds nsplit + ns_far partials per row and head
+    NS = nsplit + (ns_far if far else 0)
+    if far:
+        bmr = far_seq_rows if far_seq_rows else far_m // g
+        assert bmr * g <= far_m
+        _attn_far_kernel[(triton.cdiv(T, bmr), hkl, ns_far)](
+            q, kq, vq, ks if ks is not None else kq, vs if vs is not None else vq, page_table, page_table.stride(0), slot,
+            pos, pm, pl, po, T, kq.stride(-3), kq.stride(-2), (_sc_stride_pos(ks, ng) if ks is not None else 0), 128 ** -0.5,
+            G = g, DH = 128, HKL = hkl, M = far_m, BMR = bmr, BN = bn, NS_FAR = ns_far, SPLIT_OFF = nsplit, NSTRIDE = NS,
+            BITS = bits, PS = ps, EXTENT = cfg.rel_extent, NG = ng, Q16 = q16, SEQ_ROWS = far_seq_rows, num_warps = FAR_WARPS,
+        )
     _attn_kernel[(T, hkl, nsplit)](
         q, R if R is not None else q, sink, kq, vq, ks if ks is not None else kq, vs if vs is not None else vq,
         page_table if page_table is not None else slot, page_table.stride(0) if page_table is not None else 0, slot, pos,
@@ -545,9 +634,9 @@ def attention(q, R, sink, gate, kq, vq, ks, vs, page_table, slot, pos, scratch, 
         G = g, GP = 16, DH = 128, HKL = hkl, BN = bn, NSPLIT = nsplit, IS_GLOBAL = is_global, BITS = bits,
         RING = ring_size, PS = ps, WINDOW = cfg.window, EXTENT = cfg.rel_extent, NG = ng, Q16 = q16,
         relq_ptr = rel[0] if rel is not None else q, relp_ptr = rel[1] if rel is not None else q, REL_FUSED = rel is not None,
-        num_warps = 4,
+        FAR = far, NSTRIDE = NS if far else 0, FAR_SEQ_ROWS = far_seq_rows if far else 0, num_warps = 4,
     )
-    _attn_combine_kernel[(T, HL)](pm, pl, po, gate, o_out, gate.stride(0), HL = HL, DH = 128, NSPLIT = nsplit,
+    _attn_combine_kernel[(T, HL)](pm, pl, po, gate, o_out, gate.stride(0), HL = HL, DH = 128, NSPLIT = NS,
                                   rot_ptr = rot if rot is not None else gate, ROT = rot is not None)
 
 

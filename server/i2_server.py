@@ -7,12 +7,13 @@ paged global KV + SWA rings, CUDA-graphed DSpark speculative decoding at every b
 Rank 0 runs the HTTP server and the scheduler; ranks 1..3 follow rank 0's command stream.
 Sampling: temperature (Gumbel-max, speculative sampling with deterministic drafts stays exact); top_p / top_k are ignored.
 """
-import os, sys, time, json, math, threading, queue, argparse, asyncio, uuid
+import os, sys, time, json, math, threading, queue, argparse, asyncio, uuid, collections, bisect
 import torch, torch.distributed as dist
 from exllamav3.model.config import Config
 from exllamav3.model.model import Model
 from exllamav3.modules.inkling2_engine import I2Engine, Batch
 from exllamav3.modules.inkling2_draft import I2Draft
+from exllamav3.modules.inkling2_prefix import SlotSnapshots, copy_page
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default=os.environ.get("MODEL_DIR", "/models/Inkling-2-Small-EXL3-4bpw"))
@@ -30,11 +31,25 @@ ap.add_argument("--kv-ng", type=int, default=4, help="global KV: fp16 scale grou
 ap.add_argument("--kv-q16", type=int, default=1, help="global 4-bit KV: 16-level symmetric grid")
 ap.add_argument("--chunk", type=int, default=512)
 ap.add_argument("--served-name", default="inkling-2-small-exl3-v3")
+ap.add_argument("--default-max-tokens", type=int, default=4096, help="max_tokens of requests that do not set it")
+ap.add_argument("--default-thinking-budget", type=int, default=-1, help="thinking_budget of requests that do not set it (-1 = none)")
+ap.add_argument("--prefix-cache", type=int, default=1, help="reuse the state of earlier prompts that a new prompt starts with")
+ap.add_argument("--prefix-snapshots", type=int, default=32, help="snapshot pool size (per-slot ring state, ~70 MB each per GPU)")
+ap.add_argument("--prefix-min", type=int, default=1024, help="shortest prefix worth a snapshot")
+ap.add_argument("--prefix-every", type=int, default=8192, help="also snapshot long prompts every N tokens (0 = only at the end)")
+ap.add_argument("--spec-mode", default="auto", choices=("auto", "spec", "plain"),
+                help="decode steps: speculative, plain (one token per step), or auto: per step, whichever yields more tokens/s "
+                     "given the drafts the active requests have been accepting")
+ap.add_argument("--probe-every", type=int, default=32, help="auto mode: one speculative step after this many plain steps, to re-measure acceptance")
+ap.add_argument("--vision", type=int, default=1, help="accept images (reference vision tower from transformers, on rank 0)")
+ap.add_argument("--max-image-tokens", type=int, default=0, help="downscale images above this many tokens (40x40 px each; 0 = never, like the reference)")
+ap.add_argument("--chat-template", default="", help="chat template file (default: <model>/chat_template.jinja)")
 ap.add_argument("--b12x", type=int, default=int(os.environ.get("I2_B12X", "0")), help="routed experts of the speculative verify through the b12x fused Trellis MoE (needs the b12x stack: cutlass-dsl + FlashInfer tree at I2_B12X_PATH)")
 args = ap.parse_args()
 if args.b12x:
     os.environ["EXL3_LOAD_ARENA"] = "0"     # b12x repack frees the per-expert tensors; arena slabs would pin a second copy
 SPEC = True               # speculative decoding is always on (every batch size); there is no plain-decode path
+NSPLIT_DEC = int(os.environ.get('I2_DEC_NSPLIT', 32))   # key splits per row for global layers in a plain decode step (was 8; 1.5x at 65K-190K positions)
 _SK = {int(k): int(v) for k, v in (x.split(":") for x in args.spec_k.split(","))} if ":" in args.spec_k else None
 def spec_k(B):
     """draft length of decode bucket B (the smallest mapped bucket >= B, else the largest)"""
@@ -42,7 +57,9 @@ def spec_k(B):
     ks = sorted(_SK)
     return _SK[next((k for k in ks if k >= B), ks[-1])]
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-torch.cuda.set_device(rank); dev = torch.device(f"cuda:{rank}")
+from exllamav3.modules.inkling2_parallel import head_shard, local_device_index
+_gpu = local_device_index()       # one GPU per node on DGX Spark: LOCAL_RANK, not the global rank
+torch.cuda.set_device(_gpu); dev = torch.device(f"cuda:{_gpu}")
 dist.init_process_group("nccl", device_id=dev)
 def log(*x):
     if rank == 0: print(time.strftime("%H:%M:%S"), *x, flush=True)
@@ -57,12 +74,49 @@ t0 = time.time()
 model.embed.load(dev)
 for L in model.layers: L.load(dev)
 model.head.load(dev)
+_mixed = [L for L in model.layers if getattr(L.mlp, "mixed_rates", False)]
+if _mixed:   # experts of different rates inside a layer (modules/inkling2_mixk.py)
+    _off = sorted({L.mlp.mk_off for L in _mixed if L.mlp.mk is None})
+    log(f"mixed-rate experts in {len(_mixed)} layers ({sum(len(L.mlp.parts) for L in _mixed)} rate classes on rank 0); "
+        f"decode-sized calls: {'one multi-rate kernel pair per layer' if not _off else 'rate classes (' + '; '.join(_off) + ')'}")
+VISION = None
+if args.vision and rank == 0:
+    from i2_vision import VisionEncoder
+    VISION = VisionEncoder(args.model, dev, max_tokens=args.max_image_tokens)
+    log(f"vision tower loaded ({VISION.n_params/1e6:.0f}M parameters, reference implementation)")
 S = args.slots
 PS = 64
-free0, total = torch.cuda.mem_get_info()
+def drop_weight_cache(model_dir):
+    """Hand the page cache the weight files left behind back to the system (no root needed). On a unified-memory GPU
+    (DGX Spark / GB10) that cache sits in the same memory the KV cache is allocated from."""
+    n = 0
+    for f in os.listdir(model_dir):
+        if f.endswith(".safetensors"):
+            try:
+                fd = os.open(os.path.join(model_dir, f), os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd); n += 1
+            except OSError:
+                pass
+    return n
+
+def free_bytes():
+    """Free memory for allocations. cudaMemGetInfo on an integrated GPU (GB10) does not count reclaimable page cache;
+    there the kernel's MemAvailable is the better estimate of what an allocation can get."""
+    free, _ = torch.cuda.mem_get_info()
+    if torch.cuda.get_device_properties(dev).is_integrated:
+        try:
+            with open("/proc/meminfo") as fh:
+                avail = next(int(l.split()[1]) * 1024 for l in fh if l.startswith("MemAvailable:"))
+            free = max(free, avail)
+        except (OSError, StopIteration, ValueError):
+            pass
+    return free
+
+ndrop = drop_weight_cache(args.model)
+free0, total = free_bytes(), torch.cuda.mem_get_info()[1]
 log(f"weights loaded in {time.time()-t0:.0f}s; GPU free {free0/2**30:.1f} GiB")
 # KV sizing: bytes per global page on this rank (target 4-bit + draft bf16)
-HKL = 8 // world
+HKL = head_shard(cfg.i2.heads, cfg.i2.kv_heads, rank, world).hkl   # this rank's KV heads (3 / 3 / 2 on 3 ranks)
 def page_bytes():
     tgt = 8 * 2 * PS * HKL * ((64 if args.bits_g == 4 else 128 if args.bits_g == 8 else 256) + (2 * args.kv_ng if args.bits_g != 16 else 0))
     drf = PS * I2Draft.global_bytes_per_token(HKL) if SPEC else 0
@@ -79,8 +133,12 @@ if args.b12x:
     tb = time.time()
     attach_moe(eng, model, args.model, cfg, dev, rank, world, sizes=sorted(set((spec_k(b) + 1) * b for b in (1, 2, 4, 8, 16) if b <= S)))
     log(f"b12x fused Trellis MoE attached for verify T={sorted(eng.b12x.sizes)} in {time.time()-tb:.0f}s (tile {eng.b12x.tile})")
-free1, _ = torch.cuda.mem_get_info()
+drop_weight_cache(args.model)
+free1 = free_bytes()
 budget = args.kv_gb * 2**30 if args.kv_gb > 0 else max(0.0, free1 - args.reserve_gb * 2**30)
+SNAP_BYTES = SlotSnapshots.bytes_per_snapshot(eng, draft) if args.prefix_cache else 0
+if args.prefix_cache:
+    budget = max(0.0, budget - args.prefix_snapshots * SNAP_BYTES)
 NP = max(16, int(budget // page_bytes()))
 NP = int(torch.tensor(NP, device=dev).min().item()) if world == 1 else int(NP)
 t = torch.tensor([NP], device=dev, dtype=torch.long); dist.all_reduce(t, op=dist.ReduceOp.MIN); NP = int(t.item())
@@ -94,7 +152,10 @@ for i, (kq, vq, ks, vs) in list(eng.kv.items()):
                      None if vs is None else torch.zeros(sshape, dtype=vs.dtype, device=dev))
 if SPEC:
     draft.alloc(NP)
+snaps = SlotSnapshots(eng, draft, args.prefix_snapshots) if args.prefix_cache else None
 torch.cuda.empty_cache()
+if args.prefix_cache:
+    log(f"prefix cache: {args.prefix_snapshots} snapshots x {SNAP_BYTES/2**20:.1f} MiB per GPU")
 log(f"KV pages: {NP} x {PS} = {NP*PS:,} tokens (per GPU {NP*page_bytes()/2**30:.1f} GiB, {page_bytes()/PS:.0f} B/token)")
 
 # ---------------------------------------------------------------------------------------------------------- state
@@ -149,7 +210,7 @@ class Bucket:
         if self.spec:
             d = d_all[sl][:, :K]
             ids = torch.cat([anchor[:, None], d], 1).reshape(-1)
-            bt = Batch(slot8, pos, nprev, True, nsplit_g=nsplit_g, nsplit_l=4, nafter=nafter)
+            bt = Batch(slot8, pos, nprev, True, nsplit_g=nsplit_g, nsplit_l=4, nafter=nafter, seq_rows=R)
             z = eng.forward(ids, bt, taps=self.taps)
             g = sample_rows(z, temps).view(B, R)
             n = (d == g[:, :K]).int().cumprod(1).sum(1)
@@ -163,7 +224,7 @@ class Bucket:
             dn = draft.draft(newanchor, self.slots, Pn, f_last, nsplit_g=nsplit_g, K=K)
             anchor_all[sl] = newanchor; P_all[sl] = Pn; d_all[sl, :K] = dn
         else:
-            bt = Batch(self.slots, P, torch.zeros(B, dtype=torch.int32, device=dev), False, nsplit_g=nsplit_g, nsplit_l=4)
+            bt = Batch(self.slots, P, torch.zeros(B, dtype=torch.int32, device=dev), False, nsplit_g=NSPLIT_DEC, nsplit_l=4)
             z = eng.forward(anchor, bt, taps=self.taps)
             if SPEC:       # keep the draft's context K/V complete so speculative steps can resume at any time
                 draft.store_context(self.taps, self.slots, P)
@@ -171,8 +232,9 @@ class Bucket:
             self.emit[:, 0] = tok; self.n.zero_()
             anchor_all[sl] = tok; P_all[sl] = P + 1
 
-buckets = {}                                        # no plain-decode graphs: every decode step is speculative
-sbuckets = {B: Bucket(B, True) for B in BUCKETS}
+# speculative buckets (draft K per bucket) and plain buckets (one token per step); --spec-mode picks which exist
+sbuckets = {B: Bucket(B, True) for B in BUCKETS} if args.spec_mode != "plain" else {}
+buckets = {B: Bucket(B, False) for B in BUCKETS} if args.spec_mode != "spec" else {}
 pool = None
 def capture(b):
     global pool
@@ -191,16 +253,41 @@ t0 = time.time()
 with torch.no_grad():
     for B in sbuckets:
         capture(sbuckets[B])
-log(f"speculative graphs captured for buckets {BUCKETS} (draft K {[spec_k(b) for b in BUCKETS]}) in {time.time()-t0:.0f}s; GPU free {torch.cuda.mem_get_info()[0]/2**30:.1f} GiB")
+    for B in buckets:
+        capture(buckets[B])
+
+@torch.no_grad()
+def calibrate(b, n=6):
+    """seconds per replay of a bucket's graph on the dummy slot (every rank replays: the graphs hold collectives)"""
+    b.slots.fill_(DUMMY)
+    for _ in range(2):
+        P_all[DUMMY] = 0; b.graph.replay()
+    torch.cuda.synchronize(); dist.barrier()
+    t = time.perf_counter()
+    for _ in range(n):
+        P_all[DUMMY] = 0; b.graph.replay()
+    torch.cuda.synchronize()
+    P_all[DUMMY] = 0
+    return (time.perf_counter() - t) / n
+
+# step-time model for --spec-mode auto, refined online with the measured decode steps
+T_STEP = {("spec", B): calibrate(b) for B, b in sbuckets.items()}
+T_STEP.update({("plain", B): calibrate(b) for B, b in buckets.items()})
+log(f"decode graphs captured for buckets {BUCKETS} (spec: {bool(sbuckets)}, draft K {[spec_k(b) for b in BUCKETS]}; plain: {bool(buckets)}) "
+    f"in {time.time()-t0:.0f}s; step ms " + ", ".join(f"{m}{B} {1000*v:.1f}" for (m, B), v in sorted(T_STEP.items())) +
+    f"; GPU free {torch.cuda.mem_get_info()[0]/2**30:.1f} GiB")
 
 # ---------------------------------------------------------------------------------------------------------- commands
-OP_NOOP, OP_PREFILL, OP_DECODE, OP_STOP = 0, 1, 2, 9
-HDR = torch.zeros(8, dtype=torch.long, device=dev)
+OP_NOOP, OP_PREFILL, OP_DECODE, OP_FORCE, OP_SNAPSHOT, OP_RESTORE, OP_STOP = 0, 1, 2, 3, 4, 5, 9
+HDR = torch.zeros(16, dtype=torch.long, device=dev)
+IMGIDX = torch.zeros(args.chunk, dtype=torch.long, device=dev)              # rows of a prefill chunk that are image tokens
+IMG = torch.zeros((args.chunk, 4608), dtype=torch.bfloat16, device=dev)    # and their features (computed on rank 0)
 PAY = torch.zeros(args.max_model_len // PS + 4096 + 64, dtype=torch.long, device=dev)
 FPAY = torch.zeros(64, dtype=torch.float32, device=dev)
 
-def bcast(hdr_vals=None, pay=None, fpay=None):
-    """rank 0 fills (hdr_vals, pay, fpay); everyone receives; returns (hdr list, payload view, float payload view)"""
+def bcast(hdr_vals=None, pay=None, fpay=None, img=None):
+    """rank 0 fills (hdr_vals, pay, fpay, img); everyone receives; returns (hdr list, payload view, float payload view).
+    h[8] = image rows in a prefill chunk: their chunk offsets go to IMGIDX and their features to IMG"""
     if rank == 0:
         HDR.zero_(); HDR[:len(hdr_vals)] = torch.tensor(hdr_vals, dtype=torch.long, device=dev)
     dist.broadcast(HDR, 0)
@@ -212,6 +299,12 @@ def bcast(hdr_vals=None, pay=None, fpay=None):
     if nf:
         if rank == 0: FPAY[:nf] = torch.tensor(fpay, dtype=torch.float32, device=dev)
         dist.broadcast(FPAY[:nf], 0)
+    nimg = h[8]
+    if nimg:
+        if rank == 0:
+            IMGIDX[:nimg].copy_(img[0]); IMG[:nimg].copy_(img[1])
+        dist.broadcast(IMGIDX[:nimg], 0)
+        dist.broadcast(IMG[:nimg], 0)
     return h, PAY[:npay], FPAY[:nf]
 
 @torch.no_grad()
@@ -225,7 +318,9 @@ def do_prefill(h, pay, fpay):
     b = Batch(torch.full((n,), slot, dtype=torch.int32, device=dev), pos, torch.arange(n, dtype=torch.int32, device=dev), True,
               nsplit_g=8, nsplit_l=4)
     taps = torch.empty((n, 8, 4608), dtype=torch.bfloat16, device=dev) if SPEC else None
-    z = eng.forward(ids, b, taps=taps)
+    nimg = h[8]
+    img = (IMGIDX[:nimg], IMG[:nimg]) if nimg else None
+    z = eng.forward(ids, b, taps=taps, img=img)
     if SPEC:
         draft.store_context(taps, b.slot, b.pos)
     if last:
@@ -270,6 +365,27 @@ def do_decode(h, pay, fpay):
         return BURST_EMIT[:nsteps, :B, :R].cpu(), BURST_N[:nsteps, :B].cpu()
     return None
 
+@torch.no_grad()
+def do_force(h):
+    """h = [OP_FORCE, slot, token, pos]: the slot's next step feeds `token` at position `pos`; the stale drafts are
+    replaced by the token itself (they are only proposals: the verify step rejects whatever is wrong)"""
+    slot, t, pos = h[1], h[2], h[3]
+    anchor_all[slot] = t; P_all[slot] = pos; d_all[slot] = t
+
+@torch.no_grad()
+def do_snapshot(h):
+    """h = [OP_SNAPSHOT, slot, sid]: copy the slot's ring state (local KV, conv rings, draft local KV) into snapshot sid"""
+    snaps.save(h[1], h[2])
+
+@torch.no_grad()
+def do_restore(h):
+    """h = [OP_RESTORE, slot, sid, cow_src, cow_dst]: copy the page that holds the prefix boundary (if any), then put
+    snapshot sid into the slot; the slot's page table (shared pages + the copy + fresh pages) arrives with the first
+    prefill chunk"""
+    if h[3] >= 0:
+        copy_page(eng, draft, h[3], h[4])
+    snaps.load(h[2], h[1])
+
 def worker_loop():
     while True:
         h, pay, fpay = bcast()
@@ -277,6 +393,9 @@ def worker_loop():
         if op == OP_STOP: break
         if op == OP_PREFILL: do_prefill(h, pay, fpay)
         elif op == OP_DECODE: do_decode(h, pay, fpay)
+        elif op == OP_FORCE: do_force(h)
+        elif op == OP_SNAPSHOT: do_snapshot(h)
+        elif op == OP_RESTORE: do_restore(h)
 
 if rank != 0:
     worker_loop()
@@ -296,24 +415,78 @@ def _raise(msg): raise jinja2.TemplateError(msg)
 jenv = jinja2.Environment(loader=jinja2.BaseLoader(), trim_blocks=False, lstrip_blocks=False)
 jenv.filters["tojson"] = _tojson
 jenv.globals["raise_exception"] = _raise
-template = jenv.from_string(open(args.model + "/chat_template.jinja").read())
+template = jenv.from_string(open(args.chat_template or args.model + "/chat_template.jinja").read())
 
 T_MSG_MODEL, T_TEXT, T_THINK, T_END, T_EOS, T_TOOL = 200001, 200004, 200008, 200010, 200006, 200049
+ROLE_TOKENS = (200000, 200001, 200002, 200003)          # <|message_user|> <|message_model|> <|message_system|> <|message_tool|>
+
+def last_message_start(ids):
+    """position where the prompt's last message begins (0 if none): a snapshot there serves new sessions with the same
+    system prompt and tools, and exact repeats of a prompt"""
+    for i in range(len(ids) - 1, 0, -1):
+        if ids[i] in ROLE_TOKENS:
+            return i
+    return 0
 
 pending = queue.Queue()
 free_slots = list(range(S))
-free_pages = list(range(1, NP))       # page 0 belongs to the dummy slot
 active = {}                           # slot -> Req
 prefilling = []                       # Reqs with remaining prompt
 loop_ref = {}
-STATS = {'dec_steps': 0, 'dec_time': 0.0, 'dec_rows': 0, 'dec_tok': 0, 'pre_time': 0.0, 'pre_tok': 0, 'idle_time': 0.0}
+STATS = {'dec_steps': 0, 'dec_time': 0.0, 'dec_rows': 0, 'dec_tok': 0, 'pre_time': 0.0, 'pre_tok': 0, 'idle_time': 0.0,
+         'spec_steps': 0, 'plain_steps': 0}
+PLAIN_STREAK = [0]
+PROBE_LEFT = [0]          # speculative steps left in a probe: the 1st refreshes stale drafts, the 2nd measures
+PROBE_GAP = [4]           # plain steps before the next probe: 4, doubling while probes keep confirming plain, up to --probe-every
+
+def choose_spec(reqs, nb):
+    """auto mode: speculative step if its expected tokens/s beats a plain step's for this batch"""
+    if not sbuckets: return False
+    if not buckets: return True
+    if any(r.n_ema is None for r in reqs): return True            # still measuring a new request's acceptance
+    if PLAIN_STREAK[0] >= PROBE_GAP[0]:                            # re-measure: soon after switching, then less often
+        PROBE_LEFT[0] = 2; PROBE_GAP[0] = min(2 * PROBE_GAP[0], args.probe_every)
+    if PROBE_LEFT[0] > 0: return True
+    Bs = next(b for b in sbuckets if b >= nb); Bp = next(b for b in buckets if b >= nb)
+    gain = sum(1.0 + r.n_ema for r in reqs) / len(reqs)          # tokens per row per speculative step
+    spec = gain * T_STEP[("plain", Bp)] > T_STEP[("spec", Bs)]
+    if spec: PROBE_GAP[0] = 4
+    return spec
+
+# ---------------------------------------------------------------------------------------------------------- prefix cache
+# reference-counted pages + LRU index of prefix snapshots (server/i2_prefix_cache.py); the callbacks run on every rank
+from i2_prefix_cache import PagePool, PrefixCache
+
+def _snapshot_all(slot, sid):
+    bcast([OP_SNAPSHOT, slot, sid]); do_snapshot(HDR.tolist())
+
+def _restore_all(slot, sid, cow_src, cow_dst):
+    bcast([OP_RESTORE, slot, sid, cow_src, cow_dst]); do_restore(HDR.tolist())
+
+page_pool = PagePool(range(1, NP))      # page 0 belongs to the dummy slot
+pcache = PrefixCache(page_pool, PS, args.prefix_snapshots if args.prefix_cache else 0, args.prefix_min,
+                     _snapshot_all, _restore_all, STATS)
 
 class Req:
-    def __init__(self, ids, max_tokens, temperature, out_q):
+    def __init__(self, ids, max_tokens, temperature, out_q, think_budget = None):
         self.ids, self.max_tokens, self.temperature, self.out_q = ids, max_tokens, temperature, out_q
         self.id = "chatcmpl-" + uuid.uuid4().hex[:24]
         self.slot = None; self.pages = []; self.done_prompt = 0; self.gen = []; self.t_arrive = time.time()
         self.first_token_time = None; self.finish = None
+        self.t_http = self.t_admit = self.t_pre0 = self.t_first_emit = None    # timing (I2_TIMING=1 logs them)
+        # thinking budget: at most `think_budget` tokens inside a <|content_thinking|> block, then <|end_message|> is
+        # forced (see force_end_thinking); last_pos = KV position of the last token handed to the client
+        self.think_budget = think_budget; self.think_mode = False; self.think_count = 0
+        self.last_pos = None; self.force_pending = False; self.n_forced = 0
+        self.pages_sent = False; self.cached = 0       # prefix cache: page table sent to the ranks; tokens restored
+        self.use_cache = True
+        self.key_ids = ids                               # prefix-cache key (image runs replaced by image-hash ids)
+        self.images = []                                 # [(pixel_values, (rows, cols))] in prompt order
+        self.img_pos = []                                # positions of image tokens in ids (sorted)
+        self.img_feats = None                            # [len(img_pos), 4608] bf16, computed on rank 0 when first needed
+        self.n_ema = None                                # auto spec mode: drafts accepted per speculative step (EMA)
+        self.fresh_drafts = True                         # False after a plain step: the slot's drafts are stale
+        self.boundary = last_message_start(ids)          # extra snapshot point (prefix cache)
 
 def emit(req, item):
     loop_ref["loop"].call_soon_threadsafe(req.out_q.put_nowait, item)
@@ -322,19 +495,29 @@ def try_admit():
     while not pending.empty() and free_slots:
         req = pending.queue[0]
         need = (len(req.ids) + req.max_tokens + 24 + PS - 1) // PS
-        if need > len(free_pages) or need > pt_len - 2:
-            if need > pt_len - 2 or need > NP - 1:
-                pending.get(); emit(req, ("error", "request longer than the KV cache / max_model_len")); continue
-            break
+        if need > pt_len - 2 or need > NP - 1:
+            pending.get(); emit(req, ("error", "request longer than the KV cache / max_model_len")); continue
+        got = pcache.admit(free_slots[0], req.key_ids, need, req.use_cache)    # may restore a cached prefix into the slot
+        if got is None:
+            break                                            # wait for running requests to free pages
         pending.get()
+        req.t_admit = time.time()
         req.slot = free_slots.pop(0)
-        req.pages = [free_pages.pop() for _ in range(need)]
+        req.pages, start = got
+        req.done_prompt = req.cached = start
         prefilling.append(req)
+
+TIMING = os.environ.get("I2_TIMING", "0") == "1"
 
 def finish(req, reason):
     req.finish = reason
+    if TIMING:
+        t = lambda a, b: f"{(b - a):.3f}" if a and b else "-"
+        print(f"TIMING {req.id[-8:]} prompt {len(req.ids)} cached {req.cached} gen {len(req.gen)} | http->arrive {t(req.t_http, req.t_arrive)}"
+              f" queue {t(req.t_arrive, req.t_admit)} admit->prefill {t(req.t_admit, req.t_pre0)} prefill {t(req.t_pre0, req.first_token_time)}"
+              f" ->first emit {t(req.first_token_time, req.t_first_emit)} total {t(req.t_arrive, time.time())}", flush=True)
     active.pop(req.slot, None)
-    free_slots.append(req.slot); free_pages.extend(req.pages)
+    free_slots.append(req.slot); pcache.release(req.pages)
     emit(req, ("done", reason))
 
 def scheduler():
@@ -345,38 +528,73 @@ def scheduler():
         if prefilling:
             req = prefilling[0]
             n = min(args.chunk, len(req.ids) - req.done_prompt)
-            first = req.done_prompt == 0
+            if args.prefix_cache and req.done_prompt < req.boundary < req.done_prompt + n:
+                n = req.boundary - req.done_prompt        # stop at the last message's start to snapshot it
+            first = not req.pages_sent                    # a restored request starts mid-prompt
+            if first: req.t_pre0 = time.time()
+            req.pages_sent = True
             last = req.done_prompt + n == len(req.ids)
             pay = req.ids[req.done_prompt:req.done_prompt + n] + (req.pages if first else [])
-            h = [OP_PREFILL, req.slot, req.done_prompt, n, int(last), len(req.pages) if first else 0, len(pay), 1 if last else 0]
+            img = None
+            if req.img_pos:
+                if req.img_feats is None:                # vision tower once per request, on rank 0
+                    pv = torch.cat([x[0] for x in req.images])
+                    req.img_feats = VISION.encode(pv, [x[1] for x in req.images])
+                lo = bisect.bisect_left(req.img_pos, req.done_prompt); hi = bisect.bisect_left(req.img_pos, req.done_prompt + n)
+                if hi > lo:
+                    img = (torch.tensor(req.img_pos[lo:hi], dtype=torch.long, device=dev) - req.done_prompt, req.img_feats[lo:hi])
+            h = [OP_PREFILL, req.slot, req.done_prompt, n, int(last), len(req.pages) if first else 0, len(pay), 1 if last else 0,
+                 0 if img is None else img[0].numel()]
             tp0 = time.time()
-            t, _, _ = bcast(h, pay, [req.temperature] if last else None)
+            t, _, _ = bcast(h, pay, [req.temperature] if last else None, img)
             res = do_prefill(HDR.tolist(), PAY[:len(pay)], FPAY[:1 if last else 0])
+            prev = req.done_prompt
             req.done_prompt += n
             STATS['pre_time'] += time.time() - tp0; STATS['pre_tok'] += n
+            if args.prefix_cache and (last or req.done_prompt == req.boundary or
+                                      (args.prefix_every and prev // args.prefix_every != req.done_prompt // args.prefix_every)):
+                pcache.add(req.slot, req.key_ids, req.done_prompt, req.pages)
             if last:
                 prefilling.pop(0)
                 req.first_token_time = time.time()
                 active[req.slot] = req
+                req.last_pos = len(req.ids) - 1          # the first sampled token sits at position len(ids)
                 handle_tokens(req, [res])
             did = True
         if active:
             slots = sorted(active)
             nb = len(slots)
-            use_spec = True
+            use_spec = choose_spec([active[s] for s in slots], nb)
             B = next(b for b in (sbuckets if use_spec else buckets) if b >= nb)
             # burst of back-to-back steps when nothing waits for admission/prefill; bounded by every active request's
             # page headroom (24 positions past max_tokens) so overshooting steps never write outside its pages
-            R = spec_k(B) + 1
+            R = spec_k(B) + 1 if use_spec else 1
             nsteps = 1
-            if not prefilling and (pending.empty() or not free_slots) and args.burst > 1:
+            if not prefilling and (pending.empty() or not free_slots) and args.burst > 1 \
+                    and not any(r.think_budget is not None and r.think_mode for r in active.values()):
                 head = min((r.max_tokens + 24 - R - len(r.gen)) // R for r in active.values())
                 nsteps = max(1, min(args.burst, head))
             h = [OP_DECODE, B, nb, int(use_spec), nsteps, 0, nb, 0]
             td0 = time.time()
             bcast(h, slots)
             emit_t, n_t = do_decode(HDR.tolist(), PAY[:nb], None)
-            STATS['dec_steps'] += nsteps; STATS['dec_time'] += time.time() - td0; STATS['dec_rows'] += nb * nsteps
+            dt = time.time() - td0
+            key = ("spec" if use_spec else "plain", B)
+            T_STEP[key] = 0.9 * T_STEP[key] + 0.1 * dt / nsteps
+            if use_spec:
+                STATS['spec_steps'] += nsteps; PLAIN_STREAK[0] = 0; PROBE_LEFT[0] = max(0, PROBE_LEFT[0] - nsteps)
+                for i, s in enumerate(slots):
+                    r = active.get(s)
+                    if r is not None:
+                        if r.fresh_drafts:       # drafts made by the previous speculative step: a fair sample
+                            n = float(n_t[:, i].float().mean())
+                            r.n_ema = n if r.n_ema is None else 0.7 * r.n_ema + 0.3 * n
+                        r.fresh_drafts = True
+            else:
+                STATS['plain_steps'] += nsteps; PLAIN_STREAK[0] += nsteps
+                for s in slots:
+                    if s in active: active[s].fresh_drafts = False
+            STATS['dec_steps'] += nsteps; STATS['dec_time'] += dt; STATS['dec_rows'] += nb * nsteps
             STATS['dec_tok'] += int(n_t[:, :nb].sum()) + nb * nsteps
             for st in range(nsteps):
                 for i, s in enumerate(slots):
@@ -390,15 +608,48 @@ def scheduler():
             if time.time() - last_hb > 1.0:
                 bcast([OP_NOOP]); last_hb = time.time()
 
+def force_end_thinking(req, pos):
+    """Thinking budget reached: put <|end_message|> at KV position `pos` as the slot's next anchor on every rank.
+    Positions >= pos that speculative steps already wrote are overwritten by the following steps (every cache - paged
+    global KV, SWA rings, conv rings, draft context - is indexed by position), so rewinding the slot is exact."""
+    bcast([OP_FORCE, req.slot, T_END, pos])
+    do_force(HDR.tolist())
+    req.force_pending = False; req.think_mode = False; req.n_forced += 1
+    req.gen.append(T_END); req.last_pos = pos
+    emit(req, ("tok", T_END))
+    if len(req.gen) >= req.max_tokens:
+        finish(req, "length")
+
 def handle_tokens(req, toks):
-    for t in toks:
+    """toks: the tokens one step produced for this slot, in order; token i sits at KV position last_pos + 1 + i.
+    All but the last are already in the KV cache (accepted drafts); the last is the slot's next anchor (written by the
+    next step)."""
+    for i, t in enumerate(toks):
         if req.slot not in active or req.finish: return
+        if req.force_pending:
+            # the budget was hit on the previous step's anchor, which this step has now written: drop this step's
+            # tokens and force the end of the thinking block right after it
+            force_end_thinking(req, req.last_pos + 1); return
         if t in (T_EOS, 199999):
             finish(req, "stop"); return
-        req.gen.append(t)
+        prev = req.gen[-1] if req.gen else None
+        req.gen.append(t); req.last_pos += 1
+        if t == T_THINK and prev == T_MSG_MODEL:
+            req.think_mode = True          # the count is cumulative: a second thinking block gets no fresh budget
+        elif t == T_END:
+            req.think_mode = False
+        elif req.think_mode:
+            req.think_count += 1
         emit(req, ("tok", t))
+        if req.t_first_emit is None: req.t_first_emit = time.time()
         if len(req.gen) >= req.max_tokens:
             finish(req, "length"); return
+        if req.think_mode and req.think_budget is not None and req.think_count >= req.think_budget:
+            if i + 1 < len(toks):
+                force_end_thinking(req, req.last_pos + 1)      # next token's position already holds a draft: overwrite
+            else:
+                req.force_pending = True                     # t is the next anchor, not in the cache yet
+            return
 
 # ---------------------------------------------------------------------------------------------------------- output parsing
 class Parser:
@@ -455,12 +706,35 @@ def encode(text):
 app = FastAPI()
 
 @app.get("/health")
-async def health(): return {"status": "ok", "stats": STATS, "spec": SPEC, "kv_tokens": NP * PS, "active": len(active), "queued": pending.qsize()}
+async def health(): return {"status": "ok", "stats": STATS, "spec": SPEC, "kv_tokens": NP * PS, "active": len(active), "queued": pending.qsize(),
+                            "prefix": pcache.info()}
+
+@app.get("/admin/expert_load")
+async def expert_load(save: int = 0, reset: int = 0):
+    """routing counts per layer and checkpoint expert since start (or the last reset), when the server runs with
+    I2_EXPERT_COUNT=1: the expert_load.json that balances a mixed-rate build's experts over the ranks. save=1 also
+    writes /work/logs/expert_load-<time>.json on rank 0; reset=1 zeroes the counts after reading them"""
+    layers = {str(L.idx): L.mlp.expert_counts(reset=bool(reset)) for L in model.layers if hasattr(L.mlp, "expert_counts")}
+    layers = {k: v for k, v in layers.items() if v is not None}
+    if not layers:
+        return {"error": "expert counting is off (start the server with -e I2_EXPERT_COUNT=1)"}
+    res = {"layers": layers, "time": time.strftime("%F %T"), "stats": dict(STATS)}
+    totals = sorted({sum(v) for v in layers.values()})
+    summary = {"layers_counted": len(layers), "rows_x_topk_per_layer": totals[:3] + (["..."] if len(totals) > 3 else [])}
+    if save:
+        path = f"/work/logs/expert_load-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        with open(path, "w") as fh:
+            json.dump(res, fh)
+        return {"saved": path, **summary}
+    return {**summary, **res}
 
 @app.get("/v1/models")
-async def models(): return {"object": "list", "data": [{"id": args.served_name, "object": "model", "owned_by": "local"}]}
+async def models(): return {"object": "list", "data": [{"id": args.served_name, "object": "model", "owned_by": "local",
+                                                         "max_model_len": args.max_model_len}]}
 
-def norm_messages(msgs):
+def norm_messages(msgs, images=None):
+    """OpenAI messages -> template input. Image parts become {"type": "image"} (the template emits one placeholder each)
+    and their URLs are appended to `images` in prompt order."""
     out = []
     for m in msgs:
         m = dict(m)
@@ -468,6 +742,12 @@ def norm_messages(msgs):
             parts = []
             for p in m["content"]:
                 if isinstance(p, dict) and p.get("type") in ("text", "input_text"): parts.append({"type": "text", "text": p.get("text", "")})
+                elif isinstance(p, dict) and p.get("type") in ("image_url", "input_image", "image"):
+                    if images is None:
+                        raise ValueError("this server was started without --vision")
+                    u = p.get("image_url")
+                    u = u.get("url") if isinstance(u, dict) else (u or p.get("url") or p.get("image"))
+                    images.append(u); parts.append({"type": "image"})
                 elif isinstance(p, str): parts.append(p)
             m["content"] = parts
         for tc in m.get("tool_calls") or []:
@@ -481,22 +761,46 @@ def norm_messages(msgs):
 async def run_request(body, chat):
     loop = asyncio.get_running_loop()
     loop_ref["loop"] = loop
+    urls = [] if VISION is not None else None
     if chat:
-        prompt = render_prompt(norm_messages(body["messages"]), body.get("tools"), body.get("reasoning_effort"))
+        prompt = render_prompt(norm_messages(body["messages"], urls), body.get("tools"), body.get("reasoning_effort"))
     else:
         prompt = body["prompt"] if isinstance(body["prompt"], str) else body["prompt"][0]
     ids = encode(prompt)
-    max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or 4096)
+    images, digests = [], []
+    if urls:
+        from i2_vision import expand_image_tokens, cache_key_ids
+        for u in urls:
+            im, dg = VISION.load_image(u)
+            images.append(VISION.prepare(im)); digests.append(dg)
+        counts = [g[0] * g[1] for _, g in images]
+        ids, img_pos = expand_image_tokens(ids, counts)
+        key_ids = cache_key_ids(ids, img_pos, counts, digests)
+    max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or args.default_max_tokens)
+    max_tokens = max(1, min(max_tokens, args.max_model_len - len(ids) - 32))   # never more than the window has left
     temp = float(body.get("temperature", 0.0) or 0.0)
+    # hard cap on thinking tokens (the template's reasoning_effort only asks the model to think less)
+    tb = body.get("thinking_budget", body.get("max_thinking_tokens"))
+    if tb is None and args.default_thinking_budget >= 0:
+        tb = args.default_thinking_budget
+    think_budget = None if tb is None or int(tb) < 0 else int(tb)
     out_q = asyncio.Queue()
-    req = Req(ids, max_tokens, temp, out_q)
+    req = Req(ids, max_tokens, temp, out_q, think_budget)
+    req.use_cache = body.get("prefix_cache", True) is not False      # "prefix_cache": false skips the lookup
+    if images:
+        req.images, req.img_pos, req.key_ids = images, img_pos, key_ids
     pending.put(req)
     return req, out_q, len(ids)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    t_http = time.time()
     body = await request.json()
-    req, out_q, nprompt = await run_request(body, True)
+    try:
+        req, out_q, nprompt = await run_request(body, True)
+    except (ValueError, OSError) as e:                     # bad image / unsupported content
+        return JSONResponse(status_code=400, content={"error": {"message": str(e), "type": "invalid_request_error"}})
+    req.t_http = t_http
     stream = bool(body.get("stream"))
     created = int(time.time())
     parser = Parser()

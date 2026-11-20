@@ -1,5 +1,5 @@
 diff --git a/exllamav3/architecture/architectures.py b/exllamav3/architecture/architectures.py
-index 25e14708..43ec50c9 100644
+index 25e1470..43ec50c 100644
 --- a/exllamav3/architecture/architectures.py
 +++ b/exllamav3/architecture/architectures.py
 @@ -29,6 +29,7 @@ from .gpt_oss import GptOssModel
@@ -19,7 +19,7 @@ index 25e14708..43ec50c9 100644
          LagunaModel,
          Lfm2Model,
 diff --git a/exllamav3/exllamav3_ext/activation_kernels.cuh b/exllamav3/exllamav3_ext/activation_kernels.cuh
-index a6df688c..be188612 100644
+index a6df688..be18861 100644
 --- a/exllamav3/exllamav3_ext/activation_kernels.cuh
 +++ b/exllamav3/exllamav3_ext/activation_kernels.cuh
 @@ -119,6 +119,9 @@ __device__ __forceinline__ float _sigmoid_fast_exp(float x)
@@ -32,8 +32,20 @@ index a6df688c..be188612 100644
      if (limit != 0.0f)
      {
          g = fminf(g, limit);
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index 4ee49c6..dd08f59 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -320,6 +320,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("exl3_moe", &exl3_moe, "exl3_moe");
+     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
++    m.def("exl3_moe_coop_mk", &exl3_moe_coop_mk, "exl3_moe_coop_mk");
+ 
+     m.def("bighead_attn", &bighead_attn, "bighead_attn");
+     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
 diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
-index d5022c6b..479aa357 100644
+index d5022c6..479aa35 100644
 --- a/exllamav3/exllamav3_ext/libtorch/mlp.h
 +++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
 @@ -8,7 +8,7 @@ namespace py = pybind11;
@@ -45,11 +57,69 @@ index d5022c6b..479aa357 100644
  
  // Gate and up projections run as one fused MGEMM when the pointer tables are given, otherwise
  // as two separate GEMV/GEMM calls -- for num_tokens > 1 these go directly through exl3_gemm_gr
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk.cu
+new file mode 100644
+index 0000000..abe16df
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk.cu
+@@ -0,0 +1,22 @@
++#include "exl3_moe_coop_instances.cuh"
++#include "../exl3_moe_coop_kernel.cuh"
++
++// Mixed rates, mul1 codebook: every block decodes its expert at the width of its rate code (1.5 ... 4 bpw, see
++// gemv_tile_mk). The shared-memory layout is the staged one (1.5 / 2.5 / 3 / 3.5 bpw stage; 2 and 4 leave it unused),
++// so the template width only sizes it and is otherwise unused
++
++MoeCoopKernel exl3_moe_coop_kernel_a_mk(int Hi, bool wide)
++{
++    using namespace exl3_moe_coop_ns;
++    const int smem = smem_a_bytes<1, true>(Hi);
++    if (wide) return { (void*) exl3_moe_coop_a_kernel<4, 2, true, false, true>, smem };
++    return { (void*) exl3_moe_coop_a_kernel<4, 2, false, false, true>, smem };
++}
++
++MoeCoopKernel exl3_moe_coop_kernel_b_mk(bool wide)
++{
++    using namespace exl3_moe_coop_ns;
++    const int smem = smem_b_bytes<1, true>();
++    if (wide) return { (void*) exl3_moe_coop_b_kernel<4, 2, true, false, true>, smem };
++    return { (void*) exl3_moe_coop_b_kernel<4, 2, false, false, true>, smem };
++}
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh
+index 940cb78..b0b5058 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh
+@@ -37,6 +37,11 @@ EXL3_MOE_COOP_INST_DECL_H(3)
+ 
+ #undef EXL3_MOE_COOP_INST_DECL_H
+ 
++// Mixed rates (exl3_moe_coop_inst_mk.cu), mul1 codebook: one kernel pair for experts of 1.5 ... 4 bpw, each block
++// taking its expert's width from the rate code tables (MoeCoopParams::k_gu_code / k_d_code)
++MoeCoopKernel exl3_moe_coop_kernel_a_mk(int Hi, bool wide);
++MoeCoopKernel exl3_moe_coop_kernel_b_mk(bool wide);
++
+ #define EXL3_MOE_COOP_INST_DEF_H(K) \
+     MoeCoopKernel exl3_moe_coop_kernel_a_h##K(int Hi, bool wide) \
+     { \
 diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
-index b343ae2b..fdf6a7a1 100644
+index b343ae2..8ddcf26 100644
 --- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
 +++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
-@@ -241,7 +241,7 @@ MoeCoopParams exl3_moe_coop_prepare
+@@ -151,8 +151,11 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int
+ 
+     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
+     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
+-    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
+-    MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
++    // Mixed rates: one kernel pair whose blocks take their expert's width from the rate codes
++    const bool mk = p.k_gu_code != nullptr;
++    TORCH_CHECK(!mk || (cb == 2 && p.k_d_code != nullptr), "exl3_moe_coop: mixed rates need the mul1 codebook and both code tables");
++    MoeCoopKernel ka = mk ? exl3_moe_coop_kernel_a_mk(p.Hi, wide_a) : moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
++    MoeCoopKernel kb = mk ? exl3_moe_coop_kernel_b_mk(wide_b) : moe_coop_kernel_b(K_d, cb, wide_b);
+     moe_coop_smem_optin(ka.kernel, ka.smem);
+     moe_coop_smem_optin(kb.kernel, kb.smem);
+ 
+@@ -241,7 +244,7 @@ MoeCoopParams exl3_moe_coop_prepare
      check_scratch(act_out, p.I);
      check_scratch(d_out, p.Ho);
      TORCH_CHECK(out.dim() >= 2 && out.stride(-1) == 1, "exl3_moe_coop: out shape");
@@ -58,8 +128,110 @@ index b343ae2b..fdf6a7a1 100644
  
      // Counters: the gate/up stage's block covers every slot the scratch can hold, the down
      // stage's every token row the output can hold
+@@ -380,3 +383,48 @@ void exl3_moe_coop
+     p.max_expert = max_expert;
+     exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, sh_out);
+ }
++
++void exl3_moe_coop_mk
++(
++    const at::Tensor& x,
++    const at::Tensor& sel,
++    const at::Tensor& rw,
++    int min_expert,
++    int max_expert,
++    int Hi,
++    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
++    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
++    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
++    int act,
++    float act_limit,
++    at::Tensor& had_g,
++    at::Tensor& had_u,
++    at::Tensor& gu_g,
++    at::Tensor& gu_u,
++    at::Tensor& act_out,
++    at::Tensor& d_out,
++    at::Tensor& ctr,
++    at::Tensor& out,
++    const at::Tensor& k_gu_code,
++    const at::Tensor& k_d_code
++)
++{
++    TORCH_CHECK_DTYPE(x, kHalf);
++    TORCH_CHECK_DTYPE(sel, kLong);
++    TORCH_CHECK_DTYPE(rw, kHalf);
++    TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous(), "exl3_moe_coop_mk: sel/rw must be contiguous");
++    TORCH_CHECK(sel.sizes() == rw.sizes() && sel.dim() == 2 && sel.size(0) == x.size(0), "exl3_moe_coop_mk: sel/rw must be (bsz, topk)");
++    for (const at::Tensor* t : { &k_gu_code, &k_d_code })
++        TORCH_CHECK(t->scalar_type() == at::kByte && t->is_contiguous() && t->dim() == 1 && t->size(0) == u_trellis.size(0) &&
++                    t->device() == x.device(), "exl3_moe_coop_mk: rate codes must be uint8 (n_local,) on the input's device");
++    float K_gu, K_d; int cb;
++    MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
++                                            c10::nullopt, c10::nullopt, c10::nullopt, 4.0f, 4.0f, 4.0f, false, true,
++                                            act, act_limit, true, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out,
++                                            c10::nullopt, K_gu, K_d, cb);
++    p.min_expert = min_expert;
++    p.max_expert = max_expert;
++    p.k_gu_code = (const uint8_t*) k_gu_code.data_ptr();
++    p.k_d_code = (const uint8_t*) k_d_code.data_ptr();
++    exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, c10::nullopt);
++}
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+index 3bf3061..56156a0 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+@@ -68,6 +68,12 @@ struct MoeCoopParams
+     int n_local;                // entries in the pointer tables
+     int sh_gate_n;              // shared gate weight length (checked against H per call)
+ 
++    // Mixed rates (nullable; mul1 codebook): per local expert the rate code of gate/up and of down (uint8, codes
++    // 0..5 = 1.5, 2, 2.5, 3, 3.5, 4 bpw). Set, the launcher runs the multi-rate kernels, whose blocks take their
++    // expert's tile width from these, so a layer whose experts have different rates still takes two launches
++    const uint8_t* k_gu_code;
++    const uint8_t* k_d_code;
++
+     // Output
+     float* out;                 // (bsz, H_out), row stride out_stride
+     int out_stride;
+@@ -151,6 +157,35 @@ void exl3_moe_coop
+     const c10::optional<at::Tensor>& sh_gate_w
+ );
+ 
++// Mixed-rate front end: exl3_moe_coop with per-expert rate codes (uint8 (n_local,) tables, codes 0..5 = 1.5 ... 4
++// bpw) for gate/up and down; mul1 codebook only. K arguments are checked but the kernels take the codes
++void exl3_moe_coop_mk
++(
++    const at::Tensor& x,
++    const at::Tensor& sel,
++    const at::Tensor& rw,
++    int min_expert,
++    int max_expert,
++    int Hi,
++    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
++    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
++    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
++    int act,
++    float act_limit,
++    at::Tensor& had_g,
++    at::Tensor& had_u,
++    at::Tensor& gu_g,
++    at::Tensor& gu_u,
++    at::Tensor& act_out,
++    at::Tensor& d_out,
++    at::Tensor& ctr,
++    at::Tensor& out,
++    const at::Tensor& k_gu_code,
++    const at::Tensor& k_d_code
++);
++
++#define MOE_COOP_MK_CODES 6
++
+ // Length of the int32 scratch for a module: completion counters + run table (slots_max =
+ // MAX_BSZN * top_k)
+ inline int64_t exl3_moe_coop_ctr_len(int64_t slots_max, int64_t bsz_max, int64_t I, int64_t Ho)
 diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
-index ce8a2f1e..f44cae9a 100644
+index ce8a2f1..c4012dc 100644
 --- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
 +++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
 @@ -43,7 +43,7 @@ template <bool WIDE> constexpr int tile_wk() { return WK / tile_wn<WIDE>(); }  /
@@ -96,8 +268,106 @@ index ce8a2f1e..f44cae9a 100644
          }
          sh_order[rank] = (int16_t) t;
          atomicMax(sh_res, rank + 1);     // active slot count
+@@ -543,6 +546,42 @@ __device__ __forceinline__ void gemv_tile
+     __syncthreads();
+ }
+ 
++// Mixed rates (mul1 codebook): the tile width of the block's expert, from its rate code (MOE_COOP_MK_*: 0..5 =
++// 1.5, 2, 2.5, 3, 3.5, 4 bpw). Block-uniform (one expert run per block), so no divergence; the staged widths share
++// the staging area the multi-rate kernels always reserve
++template <int cb, bool WIDE>
++__device__ __forceinline__ void gemv_tile_mk
++(
++    int code,
++    const uint32_t* __restrict__ B32,
++    const half2* __restrict__ A2,
++    size_t a_stride2,
++    const int* __restrict__ rows,
++    int nrows,
++    void* __restrict__ C,
++    size_t c_stride,
++    bool c_f32,
++    int k_begin,
++    int k_end,
++    int ntiles,
++    int group,
++    float* __restrict__ sh_red,
++    uint32_t* __restrict__ sh_stage
++)
++{
++    #define GEMV_TILE_MK_ARGS B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage
++    switch (code)
++    {
++        case 0:  gemv_tile<1, cb, WIDE, true >(GEMV_TILE_MK_ARGS); break;
++        case 1:  gemv_tile<2, cb, WIDE, false>(GEMV_TILE_MK_ARGS); break;
++        case 2:  gemv_tile<2, cb, WIDE, true >(GEMV_TILE_MK_ARGS); break;
++        case 3:  gemv_tile<3, cb, WIDE, false>(GEMV_TILE_MK_ARGS); break;
++        case 4:  gemv_tile<3, cb, WIDE, true >(GEMV_TILE_MK_ARGS); break;
++        default: gemv_tile<4, cb, WIDE, false>(GEMV_TILE_MK_ARGS); break;
++    }
++    #undef GEMV_TILE_MK_ARGS
++}
++
+ // Completion counter: every thread fences its own stores, then one thread arrives. Returns true
+ // (block-uniform) for the last arriving block, which may then read the other blocks' results
+ // through L2 (load_*_cg)
+@@ -673,7 +712,8 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
+ // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
+ // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
+ 
+-template <int bits, int cb, bool WIDE, bool HALF = false>
++// MK: mixed rates, every block takes its expert's width from p.k_gu_code (bits / HALF unused)
++template <int bits, int cb, bool WIDE, bool HALF = false, bool MK = false>
+ __global__ __launch_bounds__(THREADS)
+ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ {
+@@ -748,7 +788,10 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
+         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
+         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
+-        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
++        if constexpr (MK)
++            gemv_tile_mk<cb, WIDE>(p.k_gu_code[local], B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
++        else
++            gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+     }
+ 
+     for (int r = 0; r < nrows; ++r)
+@@ -809,7 +852,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ // token's slots (rotation * svh, down bias, routing weight) in a fixed order, merges the shared
+ // expert and stores the trimmed row
+ 
+-template <int bits, int cb, bool WIDE, bool HALF = false>
++template <int bits, int cb, bool WIDE, bool HALF = false, bool MK = false>
+ __global__ __launch_bounds__(THREADS)
+ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+ {
+@@ -819,7 +862,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+     extern __shared__ uint32_t smem_dyn[];
+     float* sh_red = (float*) smem_dyn;
+     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
+-    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0));
++    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + ((MK || tile_may_stage<bits, HALF>()) ? WK * STAGE_WORDS : 0));
+     __shared__ int sh_flag;
+     __shared__ int sh_n_active;
+     __shared__ float sh_gate;
+@@ -849,8 +892,12 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+     {
+         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
+         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
+-        gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
++        if constexpr (MK)
++            gemv_tile_mk<cb, WIDE>(p.k_d_code[local], B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
++                                   k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
++        else
++            gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
++                                            k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+     }
+ 
+     for (int r = 0; r < nrows; ++r)
 diff --git a/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh b/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh
-index b6bad240..5c64dbc0 100644
+index b6bad24..5c64dbc 100644
 --- a/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh
 +++ b/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh
 @@ -6,6 +6,8 @@
@@ -141,7 +411,7 @@ index b6bad240..5c64dbc0 100644
          vu.x = __hmax2(vu.x, __float2half2_rn(-act_limit));
          vu.y = __hmax2(vu.y, __float2half2_rn(-act_limit));
 diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
-index 8751829a..0e415504 100644
+index 8751829..0e41550 100644
 --- a/exllamav3/modules/block_sparse_mlp.py
 +++ b/exllamav3/modules/block_sparse_mlp.py
 @@ -44,7 +44,7 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
@@ -164,7 +434,7 @@ index 8751829a..0e415504 100644
              all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
          )
 diff --git a/exllamav3/modules/mlp.py b/exllamav3/modules/mlp.py
-index 867f3a55..bf498c68 100644
+index 867f3a5..bf498c6 100644
 --- a/exllamav3/modules/mlp.py
 +++ b/exllamav3/modules/mlp.py
 @@ -12,7 +12,7 @@ from ..model.model_tp_alloc import TPAllocation

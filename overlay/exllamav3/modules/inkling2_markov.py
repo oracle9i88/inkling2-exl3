@@ -103,7 +103,7 @@ class MarkovStep:
         self.B = B
         self.BP = max(16, triton.next_power_of_2(B))
         eng = draft.eng
-        self.Vs = eng.head.unembed.shape[0]
+        self.Vs = eng.head.rows_n
         self.valid = min(self.Vs, eng.cfg.unpadded_vocab - eng.rank * self.Vs)
         self.BN = 128
         self.NT = triton.cdiv(self.Vs, self.BN)

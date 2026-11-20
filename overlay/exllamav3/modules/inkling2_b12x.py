@@ -356,6 +356,10 @@ def ep_layout():
 
 def prepare_model(model):
     """call after Model.from_config, before loading layers: EP2xTP2 loads its own expert shards"""
+    mixed = [L.idx for L in model.layers if getattr(L.mlp, "mixed_rates", False)]
+    if mixed:
+        raise ValueError(f"b12x runs one rate per layer (K4 mcg); the experts of layers {mixed} mix rates "
+                         f"(modules/inkling2_mixk.py): serve this model with --b12x 0")
     if ep_layout() == "ep2tp2":
         strip_experts(model)
 

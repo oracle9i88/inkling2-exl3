@@ -26,7 +26,9 @@ if a.b12x:
     os.environ["EXL3_LOAD_ARENA"] = "0"     # b12x repack frees the per-expert tensors; arena slabs would pin a second copy
 
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-torch.cuda.set_device(rank); dev = torch.device(f"cuda:{rank}")
+from exllamav3.modules.inkling2_parallel import local_device_index
+_gpu = local_device_index()       # one GPU per node on DGX Spark: LOCAL_RANK, not the global rank
+torch.cuda.set_device(_gpu); dev = torch.device(f"cuda:{_gpu}")
 dist.init_process_group("nccl", device_id=dev)
 def log(*x):
     if rank == 0: print(time.strftime("%H:%M:%S"), *x, flush=True)

@@ -12,6 +12,8 @@ import triton
 import triton.language as tl
 from safetensors import safe_open
 
+from .inkling2_parallel import even_slice
+
 BLOCK = 8                 # anchor + 7 masks
 RINGD = 1024 + 8 + 56     # local-layer draft KV ring (positions modulo RINGD)
 
@@ -118,11 +120,14 @@ class I2Draft:
         self.cfg = eng.cfg
         self.max_slots, self.ps = max_slots, page_size
         D = 4608
-        self.Hl, self.Hkl = 48 // world, 8 // world
+        # attention by whole KV groups like the target (same split, see inkling2_parallel.py); MLP width split evenly
+        self.shard = eng.shard
+        self.Hl, self.Hkl = self.shard.hl, self.shard.hkl
         self.G = self.Hl // self.Hkl
         f = safe_open(path, "pt")
         g = lambda k: f.get_tensor(k).to(device)
-        sh = lambda t, dim = 0: t.chunk(world, dim)[rank].contiguous()
+        qs, ks = self.shard.q_rows, self.shard.kv_rows
+        sh = lambda t, dim = 0: even_slice(t, rank, world, dim)
         self.L = []
         for i in range(5):
             p = f"layers.{i}."
@@ -130,9 +135,9 @@ class I2Draft:
             L["ln_in"], L["ln_post"], L["dflare"] = g(p + "input_layernorm.weight"), g(p + "post_attention_layernorm.weight"), g(p + "dflare_norm.weight")
             L["qn"], L["kn"], L["knc"] = g(p + "self_attn.q_norm.weight"), g(p + "self_attn.k_norm.weight"), g(p + "self_attn.k_norm_ctx.weight")
             a = p + "self_attn."
-            L["wqkv"] = torch.cat([sh(g(a + "q_proj.weight")), sh(g(a + "k_proj.weight")), sh(g(a + "v_proj.weight"))], 0).contiguous()
-            L["wkv_ctx"] = torch.cat([sh(g(a + "k_proj_ctx.weight")), sh(g(a + "v_proj_ctx.weight"))], 0).contiguous()
-            L["wo"] = sh(g(a + "o_proj.weight"), 1)
+            L["wqkv"] = torch.cat([qs(g(a + "q_proj.weight")), ks(g(a + "k_proj.weight")), ks(g(a + "v_proj.weight"))], 0).contiguous()
+            L["wkv_ctx"] = torch.cat([ks(g(a + "k_proj_ctx.weight")), ks(g(a + "v_proj_ctx.weight"))], 0).contiguous()
+            L["wo"] = qs(g(a + "o_proj.weight"), 1)
             L["wgu"] = torch.cat([sh(g(p + "mlp.gate_proj.weight")), sh(g(p + "mlp.up_proj.weight"))], 0).contiguous()
             L["wd"] = sh(g(p + "mlp.down_proj.weight"), 1)
             self.L.append(L)
@@ -156,7 +161,7 @@ class I2Draft:
         self.rnn_w, self.rnn_b = g(mh + "rnn_proj.weight"), g(mh + "rnn_proj.bias").float()
         ho_w, ho_b = g(mh + "hidden_out.weight"), g(mh + "hidden_out.bias")
         # fold hidden_out into this rank's lm_head rows (fp64, rounded once)
-        U = eng.head.unembed
+        U = eng.head.dense_rows()                        # bf16 rows, or the EXL3 head (v3) reconstructed once here
         self.fold_w = torch.empty((U.shape[0], 256), dtype = torch.bfloat16, device = device)
         self.fold_b = torch.empty((U.shape[0],), dtype = torch.bfloat16, device = device)
         for s in range(0, U.shape[0], 4096):
@@ -295,7 +300,7 @@ class I2Draft:
         eng = self.eng
         hid = self.block_forward(anchor_tok, slot, pa, nsplit_g, nsplit_l).view(B, BLOCK, -1)[:, 1:K + 1]   # [B, K, D]
         hid = hid.reshape(B * K, -1)
-        base = torch.mm(hid, eng.head.unembed.t())                                                           # bf16 [B*K, V/w]
+        base = eng.head_mm_bf16(hid)                                                                         # bf16 [B*K, V/w]
         f_rnn = self.mix(f_feats, 5, self.m_dflare)                                                          # [B, D]
         Wc = self.rnn_w[:, 512:]
         inp = torch.cat([hid.view(B, K, -1), f_rnn[:, None].expand(B, K, -1)], -1).transpose(0, 1).reshape(K * B, -1)
