@@ -477,6 +477,7 @@ class Req:
         # thinking budget: at most `think_budget` tokens inside a <|content_thinking|> block, then <|end_message|> is
         # forced (see force_end_thinking); last_pos = KV position of the last token handed to the client
         self.think_budget = think_budget; self.think_mode = False; self.think_count = 0
+        self.gone = False                                # the client hung up: drop it from the queue / end it
         self.last_pos = None; self.force_pending = False; self.n_forced = 0
         self.pages_sent = False; self.cached = 0       # prefix cache: page table sent to the ranks; tokens restored
         self.use_cache = True
@@ -491,9 +492,23 @@ class Req:
 def emit(req, item):
     loop_ref["loop"].call_soon_threadsafe(req.out_q.put_nowait, item)
 
+def drop_gone():
+    """11-21: a client that hung up (stopped reply, timed-out retry) used to keep its slot until max_tokens. Queued
+    ones are dropped; decoding ones end now. One still reading its prompt is ended at its first decode step, so the
+    prefix cache never sees a half-written prompt."""
+    while not pending.empty() and pending.queue[0].gone:
+        pending.get(); STATS["gone"] = STATS.get("gone", 0) + 1
+    for req in [r for r in active.values() if r.gone]:
+        STATS["gone"] = STATS.get("gone", 0) + 1
+        finish(req, "client_gone")
+
+
 def try_admit():
+    drop_gone()
     while not pending.empty() and free_slots:
         req = pending.queue[0]
+        if req.gone:
+            pending.get(); continue
         need = (len(req.ids) + req.max_tokens + 24 + PS - 1) // PS
         if need > pt_len - 2 or need > NP - 1:
             pending.get(); emit(req, ("error", "request longer than the KV cache / max_model_len")); continue
@@ -857,6 +872,15 @@ async def chat_completions(request: Request):
         return {"id": req.id, "object": "chat.completion.chunk", "created": created, "model": args.served_name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
     async def events():
+        sent_role = False
+        has_tool = False
+        try:
+            async for item in _events():
+                yield item
+        finally:
+            if not getattr(req, "finish", None):
+                req.gone = True                       # generator closed before "done": the client went away
+    async def _events():
         sent_role = False
         has_tool = False
         while True:
