@@ -92,7 +92,8 @@ def main():
     # config: the base's, with the experts' average rate
     cfg = json.load(open(os.path.join(a.base, "config.json")))
     q = dict(cfg.get("quantization_config") or {})
-    q.update({"quant_method": "exl3", "bits": round(avg, 3),
+    q.pop("bits", None)   # the Hub wants an int there; the average rate goes in bits_per_weight
+    q.update({"quant_method": "exl3", "bits_per_weight": round(avg, 3),
               "note": "only routed MoE experts are EXL3, each expert with its own rates (gate/up and down, 1.5 to 4 bpw "
                       "in half-bit steps); all other tensors are the source checkpoint's"})
     cfg["quantization_config"] = q

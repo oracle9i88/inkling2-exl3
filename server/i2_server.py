@@ -732,6 +732,33 @@ async def expert_load(save: int = 0, reset: int = 0):
 async def models(): return {"object": "list", "data": [{"id": args.served_name, "object": "model", "owned_by": "local",
                                                          "max_model_len": args.max_model_len}]}
 
+@app.post("/tokenize")
+@app.post("/v1/tokenize")
+async def tokenize(request: Request):
+    """vLLM-style token count (after 0xSero's 8ba4513): {"prompt": text} or {"messages": [...], "tools": ...,
+    "reasoning_effort": ...}, rendered with the chat template as a chat request would be. Images count with their
+    expanded placeholder tokens, so `count` is what the prompt will take in the KV cache."""
+    body = await request.json()
+    urls = [] if VISION is not None else None
+    if body.get("messages"):
+        try:
+            text = render_prompt(norm_messages(body["messages"], urls), body.get("tools"), body.get("reasoning_effort"))
+        except ValueError as e:
+            return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code = 400)
+    else:
+        text = body.get("prompt") or body.get("content") or body.get("text") or ""
+        if isinstance(text, list): text = text[0] if text else ""
+    ids = encode(text)
+    if urls:
+        from i2_vision import expand_image_tokens
+        counts = []
+        for u in urls:
+            im, _ = VISION.load_image(u)
+            _, g = VISION.prepare(im)
+            counts.append(g[0] * g[1])
+        ids, _ = expand_image_tokens(ids, counts)
+    return {"tokens": list(ids), "count": len(ids), "max_model_len": args.max_model_len}
+
 def norm_messages(msgs, images=None):
     """OpenAI messages -> template input. Image parts become {"type": "image"} (the template emits one placeholder each)
     and their URLs are appended to `images` in prompt order."""

@@ -201,7 +201,8 @@ def main():
     head_bits = avg_bits(lambda k: k.startswith(HEAD_Q + "."))
     vocab_rows = heads[where[HEAD_Q + ".svh"]][HEAD_Q + ".svh"]["shape"][0] if head_q else None
     q = dict(cfg.get("quantization_config") or {})
-    q.update({"quant_method": "exl3", "bits": round(exp_bits, 3), "codebook": "mul1", "out_scales": "always"})
+    q.pop("bits", None)   # the Hub wants an int there; the average rate goes in bits_per_weight
+    q.update({"quant_method": "exl3", "bits_per_weight": round(exp_bits, 3), "codebook": "mul1", "out_scales": "always"})
     parts = [f"routed MoE experts: EXL3, a rate per expert (gate/up and down, 1.5 to 4 bpw in half-bit steps), "
              f"{exp_bits:.3f} bpw on average"]
     if attn_bits:

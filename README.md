@@ -193,6 +193,8 @@ Rank 0 serves an OpenAI-compatible API on port 18100:
 - `/v1/chat/completions` with streaming, reasoning content, tool calls (nested parameters and parallel calls) and
   images as `data:` URLs;
 - `/v1/completions`, `/v1/models`;
+- `/tokenize` (also `/v1/tokenize`): the token count of `{"prompt": ...}` or of `{"messages": [...], "tools": ...}` rendered
+  as a chat request, images included;
 - `/health`, with decode, prefill and prefix-cache counters.
 
 Per request you can set `reasoning_effort` (chat template), `thinking_budget` (tokens), and `prefix_cache: false` to
