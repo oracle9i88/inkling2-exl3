@@ -488,6 +488,7 @@ class Req:
         # forced (see force_end_thinking); last_pos = KV position of the last token handed to the client
         self.think_budget = think_budget; self.think_mode = False; self.think_count = 0
         self.think_ids = []; self.loop_max = 0.0; self.loop_cut = False   # loop guard: recent thinking tokens, max ratio seen
+        self.n_reopen = 0
         self.ans_ids = []; self.ans_count = 0; self.ans_loop_max = 0.0; self.ans_cut = False   # the same outside thinking
         self.gone = False                                # the client hung up: drop it from the queue / end it
         self.last_pos = None; self.force_pending = False; self.n_forced = 0
@@ -566,7 +567,10 @@ def finish(req, reason):
               f" queue {t(req.t_arrive, req.t_admit)} admit->prefill {t(req.t_admit, req.t_pre0)} prefill {t(req.t_pre0, req.first_token_time)}"
               f" ->first emit {t(req.first_token_time, req.t_first_emit)} total {t(req.t_arrive, time.time())}"
               f" | {reason} think {req.think_count} loop_max {req.loop_max:.2f}{' CUT' if req.loop_cut else ''}"
-              f" answer {req.ans_count} loop_max {req.ans_loop_max:.2f}{' CUT' if req.ans_cut else ''} temp {req.temperature}", flush=True)
+              f" answer {req.ans_count} loop_max {req.ans_loop_max:.2f}{' CUT' if req.ans_cut else ''} temp {req.temperature}"
+              f"{f' reopen {req.n_reopen}' if req.n_reopen else ''}", flush=True)
+        if os.environ.get("I2_DEBUG_TAIL") == "1":
+            print(f"TAIL {req.id[-8:]} {tok.decode(req.gen[-64:], skip_special_tokens=False)!r}", flush=True)
     active.pop(req.slot, None)
     free_slots.append(req.slot); pcache.release(req.pages)
     emit(req, ("done", reason))
@@ -661,6 +665,16 @@ def scheduler():
             if time.time() - last_hb > 1.0:
                 bcast([OP_NOOP]); last_hb = time.time()
 
+def force_token(req, pos, tok):
+    """put `tok` at KV position `pos` as the slot's next anchor (see force_end_thinking) and hand it to the client"""
+    bcast([OP_FORCE, req.slot, tok, pos])
+    do_force(HDR.tolist())
+    req.force_pending = False
+    req.gen.append(tok); req.last_pos = pos
+    emit(req, ("tok", tok))
+    if len(req.gen) >= req.max_tokens:
+        finish(req, "length")
+
 def force_end_thinking(req, pos):
     """Thinking budget reached: put <|end_message|> at KV position `pos` as the slot's next anchor on every rank.
     Positions >= pos that speculative steps already wrote are overwritten by the following steps (every cache - paged
@@ -726,6 +740,13 @@ def handle_tokens(req, toks):
         if t in (T_EOS, 199999):
             finish(req, "stop"); return
         prev = req.gen[-1] if req.gen else None
+        if t == T_THINK and prev == T_MSG_MODEL and req.think_budget is not None and req.think_count >= req.think_budget:
+            # the budget is spent and the model opens another thinking block (after a long thought cut short it tends to
+            # go on thinking, and each new block was ended at once: no answer until max_tokens). Open a text block.
+            req.n_reopen += 1; STATS["think_reopen"] = STATS.get("think_reopen", 0) + 1
+            if req.n_reopen <= 3 or req.n_reopen % 100 == 0:
+                print(f"thinking reopened after its budget: {req.id[-8:]} ({req.n_reopen}x), text block forced", flush=True)
+            force_token(req, req.last_pos + 1, T_TEXT); return
         req.gen.append(t); req.last_pos += 1
         if t == T_THINK and prev == T_MSG_MODEL:
             req.think_mode = True          # the count is cumulative: a second thinking block gets no fresh budget
