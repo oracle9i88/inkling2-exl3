@@ -523,6 +523,10 @@ def try_admit():
         prefilling.append(req)
 
 TIMING = os.environ.get("I2_TIMING", "0") == "1"
+# 11-21: a streamed reply is silent while it waits in the queue, while its prompt is read and while a tool call is
+# generated (tool calls are sent whole). Agent clients give up after a few minutes without a chunk (pi: 300 s), so an
+# empty chunk goes out after KEEPALIVE seconds of silence. It also lets the server see a client that left while queued.
+KEEPALIVE = float(os.environ.get("I2_KEEPALIVE", "15"))
 
 # 11-20: rank 0's resident memory grew ~100 MB per long request (request bodies, prompt text and token lists of 100K+
 # token conversations) until the node ran out of memory twice. glibc keeps such freed blocks in the heap; give them back
@@ -868,6 +872,9 @@ async def chat_completions(request: Request):
     stream = bool(body.get("stream"))
     created = int(time.time())
     parser = Parser()
+    def usage():
+        return {"prompt_tokens": nprompt, "completion_tokens": len(req.gen), "total_tokens": nprompt + len(req.gen),
+                "prompt_tokens_details": {"cached_tokens": req.cached}}
     def chunk(delta, finish=None):
         return {"id": req.id, "object": "chat.completion.chunk", "created": created, "model": args.served_name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
@@ -880,11 +887,19 @@ async def chat_completions(request: Request):
         finally:
             if not getattr(req, "finish", None):
                 req.gone = True                       # generator closed before "done": the client went away
+                state = "active" if req.slot in active and active.get(req.slot) is req else \
+                        "prefilling" if req in prefilling else "queued"
+                print(f"client gone: {req.id[-8:]} {state}, prompt {len(req.ids)}, generated {len(req.gen)}", flush=True)
     async def _events():
         sent_role = False
         has_tool = False
+        last = time.time()
         while True:
-            kind, val = await out_q.get()
+            try:
+                kind, val = await asyncio.wait_for(out_q.get(), max(0.5, KEEPALIVE - (time.time() - last)))
+            except asyncio.TimeoutError:
+                last = time.time(); yield {}, None     # keep-alive: queued, reading the prompt, or no token for a while
+                continue
             if kind == "tok":
                 for k, v in parser.feed(val):
                     d = {}
@@ -892,7 +907,9 @@ async def chat_completions(request: Request):
                     if k == "reasoning": d["reasoning_content"] = v
                     elif k == "content": d["content"] = v
                     elif k == "tool": d["tool_calls"] = [v]; has_tool = True
-                    yield d, None
+                    last = time.time(); yield d, None
+                if time.time() - last >= KEEPALIVE:     # tokens arrive but nothing is sendable (a tool call in progress)
+                    last = time.time(); yield {}, None
             elif kind == "done":
                 for k, v in parser.finish():
                     yield ({"reasoning_content": v} if k == "reasoning" else {"content": v}), None
@@ -905,6 +922,9 @@ async def chat_completions(request: Request):
         async def gen():
             async for d, fin in events():
                 yield f"data: {json.dumps(chunk(d, fin))}\n\n"
+            if (body.get("stream_options") or {}).get("include_usage"):
+                u = chunk({}); u["choices"] = []; u["usage"] = usage()
+                yield f"data: {json.dumps(u)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
     content, reasoning, tools, fin = "", "", [], "stop"
@@ -917,7 +937,7 @@ async def chat_completions(request: Request):
     if tools: msg["tool_calls"] = tools
     return {"id": req.id, "object": "chat.completion", "created": created, "model": args.served_name,
             "choices": [{"index": 0, "message": msg, "finish_reason": fin}],
-            "usage": {"prompt_tokens": nprompt, "completion_tokens": len(req.gen), "total_tokens": nprompt + len(req.gen)}}
+            "usage": usage()}
 
 @app.post("/v1/completions")
 async def completions(request: Request):
