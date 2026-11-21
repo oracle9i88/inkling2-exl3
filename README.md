@@ -16,6 +16,19 @@ This is a fork of [0xSero/inkling2-exl3](https://github.com/0xSero/inkling2-exl3
 [README-upstream.md](README-upstream.md); the top-level Dockerfile, `docker/`, `scripts/` and `bench/` are that 4-GPU
 setup. Everything for the Sparks is in `spark/`, `server/` and `overlay/`.
 
+## Known issue (2026-11-21)
+
+The latest server commit `299eeaf` ("drop requests whose client hung up") can misfire under concurrent load: in our
+test 3 of 19 requests were dropped while their clients were still connected, and those clients hang. Until it is
+fixed, use the previous commit:
+
+```
+git checkout 3241926
+```
+
+It differs only by this change; the memory fixes (`malloc_trim`, glibc thresholds) are kept. A separate slow rank-0
+memory growth under heavy agent-style traffic is still being investigated; restarting the server clears it.
+
 ## At a glance
 
 Measured on our nodes, 2026-11-19 (two Sparks) and 2026-11-17 (three Sparks). Speeds are from the server's own
