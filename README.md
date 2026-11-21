@@ -16,18 +16,46 @@ This is a fork of [0xSero/inkling2-exl3](https://github.com/0xSero/inkling2-exl3
 [README-upstream.md](README-upstream.md); the top-level Dockerfile, `docker/`, `scripts/` and `bench/` are that 4-GPU
 setup. Everything for the Sparks is in `spark/`, `server/` and `overlay/`.
 
-## Known issue (2026-11-21)
+## Agent clients and long thinking (2026-11-21)
 
-The latest server commit `299eeaf` ("drop requests whose client hung up") can misfire under concurrent load: in our
-test 3 of 19 requests were dropped while their clients were still connected, and those clients hang. Until it is
-fixed, use the previous commit:
+At high reasoning effort Inkling can think for tens of thousands of tokens, about 20 tokens/s per request on two
+Sparks: a 60,000-token thought takes most of an hour. Agent clients that start sub-agents fill the 4 slots and queue
+behind such requests. Before 2026-11-21 the server sent nothing while a request waited or read its prompt, did not
+report usage in the stream, and let a looping thought or reply run to `max_tokens`. Clients then timed out, lost
+requests, could not tell when to compact their context, or got no answer. The server now:
 
-```
-git checkout 3241926
-```
+- sends an empty chunk after 15 s of silence (waiting in the queue, reading a long prompt, generating a tool call,
+  which is sent whole); `I2_KEEPALIVE` sets the interval;
+- reports usage in the stream when the request sets `stream_options.include_usage` (prompt, completion and cached
+  tokens);
+- ends thinking at least `--answer-reserve` tokens (default 8,192, at most a quarter of `max_tokens`) before
+  `max_tokens`, so the answer has room; if the model then opens another thinking block, a text block is opened instead;
+- ends a thought that repeats itself: `--think-loop-guard 0.5`, when half of the last 2,048 thinking tokens are
+  32-token runs already seen in that window. The model then answers;
+- ends a reply that repeats itself: `--answer-loop-guard 0.8` over the last 1,024 tokens outside thinking;
+- takes `--default-temperature` for requests that set none (default 0, greedy). Greedy decoding of long free text
+  is the most prone to loops; we serve with 0.7.
 
-It differs only by this change; the memory fixes (`malloc_trim`, glibc thresholds) are kept. A separate slow rank-0
-memory growth under heavy agent-style traffic is still being investigated; restarting the server clears it.
+Each request's `TIMING` log line (with `I2_TIMING=1`) shows its finish reason, thinking and answer tokens, and the
+highest repetition ratio each reached. Our checks, two Sparks, 2026-11-21:
+
+| Check | Result |
+|---|---|
+| 19 streamed agent-style requests (53K- and 147K-token prompts, tool history), 8 at a time, many waiting minutes in the queue | 19 of 19 finished; longest silence on any stream 23 s |
+| 6 held-out problems at `xhigh`, `max_tokens` 32,768 | 6 of 6 answered. One thought looped: cut at 14,080 thinking tokens at a ratio of 0.53, then the right answer. One thought reached the reserve at 24,576 tokens, reopened thinking once, and answered (right). Normal thoughts peaked at 0.00-0.05 |
+| `max_tokens` 1,200 at `xhigh` | thinking ended at 900, the answer followed |
+| loop guards on recorded text (Chinese prose, code rows, a table, a repeated sentence) | only the repeated sentence was cut |
+
+**Client.** We use [pi](https://github.com/earendil-works/pi) (`@earendil-works/pi-coding-agent`). It streams,
+asks for usage in the stream and compacts from it, and its HTTP idle timeout (300 s by default) counts the
+keep-alive chunks. Other clients work through the same OpenAI API; check that yours streams, sends
+`stream_options.include_usage` (or otherwise knows the context size), and does not give up on a request that waits
+in the queue.
+
+**Proxies.** A local HTTP proxy between client and server can cut the server's side of a long stream while the
+client's side stays open. In our test through a desktop proxy, none of the 19 requests above reached its client,
+though the server finished half of them; direct, all 19 finished. Leave the Sparks out of the proxy (`NO_PROXY`).
+An earlier note here blamed the server's handling of disconnected clients (`299eeaf`); that was this proxy.
 
 ## At a glance
 
@@ -68,7 +96,7 @@ at 24,000 tokens. Neither set was used for calibration.
 | Memory | 4x 96 GB dedicated | unified memory: KV sized from reclaimable memory, weight page cache dropped after loading |
 | Decoding | speculative (MTP draft) on every step | **auto**: per step, speculative or plain, whichever yields more tokens/s at the acceptance being measured |
 | Prompt reuse | none | **prefix cache**: shared KV pages plus snapshots of the per-slot sliding-window and convolution state |
-| Thinking | `reasoning_effort` in the chat template | also a hard `thinking_budget` (tokens) enforced by the engine |
+| Thinking | `reasoning_effort` in the chat template | also a hard `thinking_budget` (tokens) enforced by the engine, room kept for the answer, loops in thinking and replies ended (see above) |
 | Images | not served | **served**: the reference vision tower and image processor from transformers, on rank 0; prefix-cache keys include the image bytes |
 | Attention and head weights | bf16 | also **EXL3**: attention projections and the output head, sliced per rank in 128-row blocks (`inkling2_attnq.py`) |
 | Long contexts | one attention program per query row, also in 512-row prompt chunks: every row reads the whole KV cache | **far-key attention**: in prompt chunks and speculative-verify steps, the keys more than 1,024 positions behind a sequence's first row (no relative bias, no causal mask there) are read once for up to 10 rows x 6 heads (`_attn_far_kernel`); 2048-row prompt chunks. A global layer's call for 2048 rows at position 131,072: 93 ms instead of 426. |
@@ -175,7 +203,7 @@ sudo reboot
 
 ```bash
 spark/launch_2spark.sh start --slots 4 --max-model-len 524288 --default-max-tokens 32768 \
-  --default-thinking-budget 60000 --served-name inkling-2-small --spec-mode auto \
+  --default-thinking-budget 60000 --default-temperature 0.7 --served-name inkling-2-small --spec-mode auto \
   --chat-template /work/engine/server/chat_template-2ad1157.jinja --prefix-snapshots 24 --prefix-every 16384 \
   --chunk 2048
 spark/launch_2spark.sh status          # also: stop, logs [rank]
@@ -198,7 +226,7 @@ spark/launch_2spark.sh status          # also: stop, logs [rank]
 
 ```bash
 RESERVE_GB=10 spark/launch_3spark.sh start --slots 4 --max-model-len 262144 --default-max-tokens 32768 \
-  --default-thinking-budget 60000 --served-name inkling-2-small --spec-mode auto \
+  --default-thinking-budget 60000 --default-temperature 0.7 --served-name inkling-2-small --spec-mode auto \
   --chat-template /work/engine/server/chat_template-2ad1157.jinja
 ```
 
@@ -210,8 +238,9 @@ Rank 0 serves an OpenAI-compatible API on port 18100:
   as a chat request, images included;
 - `/health`, with decode, prefill and prefix-cache counters.
 
-Per request you can set `reasoning_effort` (chat template), `thinking_budget` (tokens), and `prefix_cache: false` to
-bypass the cache.
+Streams send a keep-alive chunk after 15 s of silence and, with `stream_options.include_usage`, a final usage chunk.
+Per request you can set `reasoning_effort` (chat template), `thinking_budget` (tokens), `temperature`, and
+`prefix_cache: false` to bypass the cache.
 
 ## Checks and tools
 
