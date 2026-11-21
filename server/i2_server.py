@@ -33,6 +33,11 @@ ap.add_argument("--chunk", type=int, default=512)
 ap.add_argument("--served-name", default="inkling-2-small-exl3-v3")
 ap.add_argument("--default-max-tokens", type=int, default=4096, help="max_tokens of requests that do not set it")
 ap.add_argument("--default-thinking-budget", type=int, default=-1, help="thinking_budget of requests that do not set it (-1 = none)")
+ap.add_argument("--answer-reserve", type=int, default=8192, help="thinking stops at least this many tokens (at most a quarter "
+                "of max_tokens) before max_tokens, so a long thought still leaves room for the answer; 0 = off")
+ap.add_argument("--think-loop-guard", type=float, default=0.5, help="end the thinking block when this fraction of the last "
+                "--think-loop-window thinking tokens repeats 32-token runs seen earlier in that window (a loop); 0 = off")
+ap.add_argument("--think-loop-window", type=int, default=2048)
 ap.add_argument("--prefix-cache", type=int, default=1, help="reuse the state of earlier prompts that a new prompt starts with")
 ap.add_argument("--prefix-snapshots", type=int, default=32, help="snapshot pool size (per-slot ring state, ~70 MB each per GPU)")
 ap.add_argument("--prefix-min", type=int, default=1024, help="shortest prefix worth a snapshot")
@@ -477,6 +482,7 @@ class Req:
         # thinking budget: at most `think_budget` tokens inside a <|content_thinking|> block, then <|end_message|> is
         # forced (see force_end_thinking); last_pos = KV position of the last token handed to the client
         self.think_budget = think_budget; self.think_mode = False; self.think_count = 0
+        self.think_ids = []; self.loop_max = 0.0; self.loop_cut = False   # loop guard: recent thinking tokens, max ratio seen
         self.gone = False                                # the client hung up: drop it from the queue / end it
         self.last_pos = None; self.force_pending = False; self.n_forced = 0
         self.pages_sent = False; self.cached = 0       # prefix cache: page table sent to the ranks; tokens restored
@@ -552,7 +558,8 @@ def finish(req, reason):
         t = lambda a, b: f"{(b - a):.3f}" if a and b else "-"
         print(f"TIMING {req.id[-8:]} prompt {len(req.ids)} cached {req.cached} gen {len(req.gen)} | http->arrive {t(req.t_http, req.t_arrive)}"
               f" queue {t(req.t_arrive, req.t_admit)} admit->prefill {t(req.t_admit, req.t_pre0)} prefill {t(req.t_pre0, req.first_token_time)}"
-              f" ->first emit {t(req.first_token_time, req.t_first_emit)} total {t(req.t_arrive, time.time())}", flush=True)
+              f" ->first emit {t(req.first_token_time, req.t_first_emit)} total {t(req.t_arrive, time.time())}"
+              f" | {reason} think {req.think_count} loop_max {req.loop_max:.2f}{' CUT' if req.loop_cut else ''}", flush=True)
     active.pop(req.slot, None)
     free_slots.append(req.slot); pcache.release(req.pages)
     emit(req, ("done", reason))
@@ -659,6 +666,32 @@ def force_end_thinking(req, pos):
     if len(req.gen) >= req.max_tokens:
         finish(req, "length")
 
+LOOP_N = 32
+def loop_ratio(ids, n=LOOP_N):
+    """fraction of the n-token runs in ids that already appeared earlier in ids"""
+    seen, hit = set(), 0
+    for i in range(len(ids) - n + 1):
+        g = tuple(ids[i:i + n])
+        if g in seen: hit += 1
+        else: seen.add(g)
+    return hit / max(1, len(ids) - n + 1)
+
+def check_loop(req, t):
+    """11-21: at high reasoning effort a thought can fall into a loop and repeat itself until max_tokens (60K+ tokens,
+    most of an hour, no answer). Every 256 thinking tokens past one window, measure the repetition of the last window;
+    over the guard the thinking block is ended exactly like a spent thinking budget, and the model answers."""
+    W = args.think_loop_window
+    req.think_ids.append(t)
+    if len(req.think_ids) > 2 * W: del req.think_ids[:-W]
+    if req.think_count < W or req.think_count % 256 or req.loop_cut: return
+    r = loop_ratio(req.think_ids[-W:])
+    req.loop_max = max(req.loop_max, r)
+    if r >= args.think_loop_guard:
+        req.loop_cut = True; STATS["loop_cut"] = STATS.get("loop_cut", 0) + 1
+        req.think_budget = req.think_count          # the budget check right after this ends the thinking block
+        print(f"thinking loop: {req.id[-8:]} at {req.think_count} thinking tokens, {r:.0%} of the last {W} repeated; "
+              f"thinking ended", flush=True)
+
 def handle_tokens(req, toks):
     """toks: the tokens one step produced for this slot, in order; token i sits at KV position last_pos + 1 + i.
     All but the last are already in the KV cache (accepted drafts); the last is the slot's next anchor (written by the
@@ -679,6 +712,8 @@ def handle_tokens(req, toks):
             req.think_mode = False
         elif req.think_mode:
             req.think_count += 1
+            if args.think_loop_guard > 0:
+                check_loop(req, t)
         emit(req, ("tok", t))
         if req.t_first_emit is None: req.t_first_emit = time.time()
         if len(req.gen) >= req.max_tokens:
@@ -852,6 +887,9 @@ async def run_request(body, chat):
     if tb is None and args.default_thinking_budget >= 0:
         tb = args.default_thinking_budget
     think_budget = None if tb is None or int(tb) < 0 else int(tb)
+    if args.answer_reserve > 0:                    # leave room for the answer however long the thought runs
+        cap = max(0, max_tokens - min(args.answer_reserve, max_tokens // 4))
+        think_budget = cap if think_budget is None else min(think_budget, cap)
     out_q = asyncio.Queue()
     req = Req(ids, max_tokens, temp, out_q, think_budget)
     req.use_cache = body.get("prefix_cache", True) is not False      # "prefix_cache": false skips the lookup
