@@ -38,6 +38,11 @@ ap.add_argument("--answer-reserve", type=int, default=8192, help="thinking stops
 ap.add_argument("--think-loop-guard", type=float, default=0.5, help="end the thinking block when this fraction of the last "
                 "--think-loop-window thinking tokens repeats 32-token runs seen earlier in that window (a loop); 0 = off")
 ap.add_argument("--think-loop-window", type=int, default=2048)
+ap.add_argument("--answer-loop-guard", type=float, default=0.8, help="end the reply when this fraction of its last "
+                "--answer-loop-window tokens outside thinking repeats 32-token runs seen earlier in that window; 0 = off")
+ap.add_argument("--answer-loop-window", type=int, default=1024)
+ap.add_argument("--default-temperature", type=float, default=0.0, help="temperature of requests that do not set one "
+                "(0 = greedy; greedy decoding of long free text is the most prone to loops)")
 ap.add_argument("--prefix-cache", type=int, default=1, help="reuse the state of earlier prompts that a new prompt starts with")
 ap.add_argument("--prefix-snapshots", type=int, default=32, help="snapshot pool size (per-slot ring state, ~70 MB each per GPU)")
 ap.add_argument("--prefix-min", type=int, default=1024, help="shortest prefix worth a snapshot")
@@ -483,6 +488,7 @@ class Req:
         # forced (see force_end_thinking); last_pos = KV position of the last token handed to the client
         self.think_budget = think_budget; self.think_mode = False; self.think_count = 0
         self.think_ids = []; self.loop_max = 0.0; self.loop_cut = False   # loop guard: recent thinking tokens, max ratio seen
+        self.ans_ids = []; self.ans_count = 0; self.ans_loop_max = 0.0; self.ans_cut = False   # the same outside thinking
         self.gone = False                                # the client hung up: drop it from the queue / end it
         self.last_pos = None; self.force_pending = False; self.n_forced = 0
         self.pages_sent = False; self.cached = 0       # prefix cache: page table sent to the ranks; tokens restored
@@ -559,7 +565,8 @@ def finish(req, reason):
         print(f"TIMING {req.id[-8:]} prompt {len(req.ids)} cached {req.cached} gen {len(req.gen)} | http->arrive {t(req.t_http, req.t_arrive)}"
               f" queue {t(req.t_arrive, req.t_admit)} admit->prefill {t(req.t_admit, req.t_pre0)} prefill {t(req.t_pre0, req.first_token_time)}"
               f" ->first emit {t(req.first_token_time, req.t_first_emit)} total {t(req.t_arrive, time.time())}"
-              f" | {reason} think {req.think_count} loop_max {req.loop_max:.2f}{' CUT' if req.loop_cut else ''}", flush=True)
+              f" | {reason} think {req.think_count} loop_max {req.loop_max:.2f}{' CUT' if req.loop_cut else ''}"
+              f" answer {req.ans_count} loop_max {req.ans_loop_max:.2f}{' CUT' if req.ans_cut else ''} temp {req.temperature}", flush=True)
     active.pop(req.slot, None)
     free_slots.append(req.slot); pcache.release(req.pages)
     emit(req, ("done", reason))
@@ -692,6 +699,20 @@ def check_loop(req, t):
         print(f"thinking loop: {req.id[-8:]} at {req.think_count} thinking tokens, {r:.0%} of the last {W} repeated; "
               f"thinking ended", flush=True)
 
+def check_answer_loop(req, t):
+    """the reply itself repeating (a sentence over and over, until max_tokens): end the request. True = end it."""
+    W = args.answer_loop_window
+    req.ans_ids.append(t); req.ans_count += 1
+    if len(req.ans_ids) > 2 * W: del req.ans_ids[:-W]
+    if req.ans_count < W or req.ans_count % 128: return False
+    r = loop_ratio(req.ans_ids[-W:])
+    req.ans_loop_max = max(req.ans_loop_max, r)
+    if r < args.answer_loop_guard: return False
+    req.ans_cut = True; STATS["answer_loop_cut"] = STATS.get("answer_loop_cut", 0) + 1
+    print(f"answer loop: {req.id[-8:]} at {req.ans_count} answer tokens, {r:.0%} of the last {W} repeated; reply ended",
+          flush=True)
+    return True
+
 def handle_tokens(req, toks):
     """toks: the tokens one step produced for this slot, in order; token i sits at KV position last_pos + 1 + i.
     All but the last are already in the KV cache (accepted drafts); the last is the slot's next anchor (written by the
@@ -714,6 +735,8 @@ def handle_tokens(req, toks):
             req.think_count += 1
             if args.think_loop_guard > 0:
                 check_loop(req, t)
+        elif args.answer_loop_guard > 0 and check_answer_loop(req, t):
+            emit(req, ("tok", t)); finish(req, "stop"); return
         emit(req, ("tok", t))
         if req.t_first_emit is None: req.t_first_emit = time.time()
         if len(req.gen) >= req.max_tokens:
@@ -881,7 +904,8 @@ async def run_request(body, chat):
         key_ids = cache_key_ids(ids, img_pos, counts, digests)
     max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or args.default_max_tokens)
     max_tokens = max(1, min(max_tokens, args.max_model_len - len(ids) - 32))   # never more than the window has left
-    temp = float(body.get("temperature", 0.0) or 0.0)
+    temp = body.get("temperature")
+    temp = args.default_temperature if temp is None else float(temp)
     # hard cap on thinking tokens (the template's reasoning_effort only asks the model to think less)
     tb = body.get("thinking_budget", body.get("max_thinking_tokens"))
     if tb is None and args.default_thinking_budget >= 0:
